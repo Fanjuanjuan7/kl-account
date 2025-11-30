@@ -2,8 +2,23 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import time
 import random
-from playwright.sync_api import sync_playwright, Page, BrowserContext
+from playwright.sync_api import sync_playwright, Page, BrowserContext, Frame
 from ..utils.logger import get_logger
+
+# 图像识别相关库（可选）
+try:
+    from PIL import Image
+    import io
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+
+try:
+    import cv2
+    import numpy as np
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
 
 
 def _generate_random_fingerprint() -> Dict[str, Any]:
@@ -86,16 +101,18 @@ def _human_drag_track(distance: int) -> Dict[str, Any]:
     steps = []
     pos = 0
     v = 0
-    while pos < distance:
+    while pos < abs(distance):  # 支持负数距离
         a = random.uniform(2, 5)
         v += a
         move = max(1, int(v))
         pos += move
-        steps.append(move)
-        if pos > distance * 0.6:
+        # 根据方向调整步骤
+        steps.append(move if distance > 0 else -move)
+        if pos > abs(distance) * 0.6:
             v -= random.uniform(1, 3)
-        if pos > distance:
-            steps.append(distance - (pos - move))
+        if pos > abs(distance):
+            last_step = abs(distance) - (pos - move)
+            steps.append(last_step if distance > 0 else -last_step)
             break
     # 微调与抖动
     for _ in range(random.randint(2, 4)):
@@ -103,94 +120,272 @@ def _human_drag_track(distance: int) -> Dict[str, Any]:
     return {"steps": steps}
 
 
-def _perform_human_drag(page: Page, slider_xpath: str, container_xpath: Optional[str] = None) -> bool:
+def _calculate_relative_distance_by_image(
+    slider_frame: Frame,
+    page: Page,
+    bg_img_xpath: str = "//img[@class='bg-img']",
+    puzzle_img_xpath: str = "//img[@class='slider-img']"
+) -> Optional[int]:
     """
-    执行拟人化滑块拖动
+    使用图像识别计算滑块需要移动的相对距离
     
-    参数：
-        page: Playwright页面对象
-        slider_xpath: 滑块元素的XPath
-        container_xpath: 滑块容器的XPath（用于计算拖动距离）
+    核心思路：
+    1. 获取背景图和拼图块在iframe中的相对位置
+    2. 使用图像识别找到缺口在背景图中的位置
+    3. 计算拼图块到缺口的相对距离
+    
+    返回：
+        相对距离（px），失败返回None
+    """
+    log = get_logger(__name__)
+    
+    if not OPENCV_AVAILABLE or not PILLOW_AVAILABLE:
+        log.warning("⚠️ OpenCV 或 Pillow 未安装，无法使用图像识别")
+        return None
+    
+    try:
+        log.info("🖼️ 开始图像识别计算相对距离...")
+        
+        # 1. 获取背景图位置
+        bg_img_locator = slider_frame.locator(f"xpath={bg_img_xpath}").first
+        bg_box = bg_img_locator.bounding_box(timeout=3000)
+        bg_src = bg_img_locator.get_attribute('src', timeout=3000)
+        
+        if not bg_box or not bg_src:
+            log.warning("⚠️ 无法获取背景图信息")
+            return None
+        
+        log.info(f"📏 背景图位置: x={bg_box['x']:.0f}, y={bg_box['y']:.0f}, w={bg_box['width']:.0f}")
+        
+        # 2. 获取拼图块位置
+        puzzle_img_locator = slider_frame.locator(f"xpath={puzzle_img_xpath}").first
+        puzzle_box = puzzle_img_locator.bounding_box(timeout=3000)
+        puzzle_src = puzzle_img_locator.get_attribute('src', timeout=3000)
+        
+        if not puzzle_box or not puzzle_src:
+            log.warning("⚠️ 无法获取拼图块信息")
+            return None
+        
+        log.info(f"🧩 拼图块位置: x={puzzle_box['x']:.0f}, y={puzzle_box['y']:.0f}, w={puzzle_box['width']:.0f}")
+        
+        # 3. 下载图片
+        bg_response = page.request.get(bg_src)
+        puzzle_response = page.request.get(puzzle_src)
+        
+        if bg_response.status != 200 or puzzle_response.status != 200:
+            log.warning("⚠️ 图片下载失败")
+            return None
+        
+        bg_data = bg_response.body()
+        puzzle_data = puzzle_response.body()
+        log.info(f"✅ 图片下载成功: 背景={len(bg_data)} bytes, 拼图={len(puzzle_data)} bytes")
+        
+        # 4. 图像识别找缺口
+        bg_img = Image.open(io.BytesIO(bg_data))
+        puzzle_img = Image.open(io.BytesIO(puzzle_data))
+        
+        bg_array = np.array(bg_img)
+        puzzle_array = np.array(puzzle_img)
+        
+        # 转换颜色空间
+        if len(bg_array.shape) == 3 and bg_array.shape[2] == 4:
+            bg_array = cv2.cvtColor(bg_array, cv2.COLOR_RGBA2BGR)
+        elif len(bg_array.shape) == 3 and bg_array.shape[2] == 3:
+            bg_array = cv2.cvtColor(bg_array, cv2.COLOR_RGB2BGR)
+        
+        if len(puzzle_array.shape) == 3 and puzzle_array.shape[2] == 4:
+            puzzle_array = cv2.cvtColor(puzzle_array, cv2.COLOR_RGBA2BGR)
+        elif len(puzzle_array.shape) == 3 and puzzle_array.shape[2] == 3:
+            puzzle_array = cv2.cvtColor(puzzle_array, cv2.COLOR_RGB2BGR)
+        
+        log.info(f"📊 图像尺寸: 背景={bg_array.shape}, 拼图={puzzle_array.shape}")
+        
+        # 使用模板匹配找缺口
+        result = cv2.matchTemplate(bg_array, puzzle_array, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        
+        gap_x_in_bg = max_loc[0]  # 缺口在背景图中的X坐标
+        log.info(f"🎯 模板匹配结果: 缺口在背景图中的位置=x={gap_x_in_bg}, 置信度={max_val:.3f}")
+        
+        if max_val < 0.5:
+            log.warning(f"⚠️ 匹配置信度过低: {max_val:.3f}")
+            return None
+        
+        # 5. 计算相对距离：缺口位置 - 拼图块当前位置
+        # 关键：在同一个坐标系内计算
+        puzzle_x_in_bg = puzzle_box['x'] - bg_box['x']  # 拼图块在背景图中的相对位置
+        relative_distance = int(gap_x_in_bg - puzzle_x_in_bg)
+        
+        log.info("\n" + "="*60)
+        log.info("📊 相对坐标计算详情:")
+        log.info(f"   背景图的iframe X坐标: {bg_box['x']:.0f}px")
+        log.info(f"   拼图块的iframe X坐标: {puzzle_box['x']:.0f}px")
+        log.info(f"   拼图块在背景图中的相对X: {puzzle_x_in_bg:.0f}px")
+        log.info(f"   缺口在背景图中的X: {gap_x_in_bg}px")
+        log.info(f"   需要移动的相对距离: {gap_x_in_bg} - {puzzle_x_in_bg:.0f} = {relative_distance}px")
+        log.info("="*60 + "\n")
+        
+        return relative_distance
+        
+    except Exception as e:
+        log.error(f"❌ 图像识别失败: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return None
+
+
+def _smart_slider_captcha(
+    slider_frame: Frame,
+    page: Page,
+    slider_xpath: str,
+    code_input_xpath: Optional[str] = None,
+    max_attempts: int = 10
+) -> bool:
+    """
+    智能滑块验证：基于相对坐标系统
+    
+    策略：
+    1. 优先尝试图像识别计算相对距离
+    2. 如果失败，使用智能距离策略：从小到大逐步尝试
+    3. 每次失败后刷新验证码，避免被锁定
     
     返回：
         成功返回True，否则返回False
     """
     log = get_logger(__name__)
+    
     try:
-        log.info(f"Looking for slider with XPath: {slider_xpath}")
+        # 获取滑块元素
+        slider_locator = slider_frame.locator(f"xpath={slider_xpath}").first
+        box = slider_locator.bounding_box(timeout=5000)
         
-        # 等待滑块出现
-        slider = page.wait_for_selector(f"xpath={slider_xpath}", timeout=10000)
-        if not slider:
-            log.warning("Slider not found")
-            return False
-        
-        log.info("Slider found, getting bounding box")
-        box = slider.bounding_box()
         if not box:
-            log.warning("Failed to get slider bounding box")
+            log.error("❌ 无法获取滑块位置")
             return False
         
-        # 计算拖动距离
-        distance = 300  # 默认距离
+        log.info(f"📍 滑块初始位置: x={box['x']:.0f}, y={box['y']:.0f}, w={box['width']:.0f}, h={box['height']:.0f}")
         
-        # 如果有容器XPath，尝试根据容器宽度计算
-        if container_xpath:
+        # 尝试图像识别计算相对距离
+        distance_from_image = _calculate_relative_distance_by_image(slider_frame, page)
+        
+        # 准备距离列表
+        if distance_from_image is not None and 50 < distance_from_image < 600:
+            log.info(f"✅ 图像识别成功，相对距离={distance_from_image}px")
+            distances_to_try = [
+                distance_from_image,
+                distance_from_image - 5,
+                distance_from_image + 5,
+                distance_from_image - 10,
+                distance_from_image + 10,
+            ]
+        else:
+            log.info("🔄 图像识别未生效，使用智能距离策略")
+            # 智能策略：基于常见缺口位置的距离
+            distances_to_try = [
+                200, 220, 180, 240, 160,  # 中等距离
+                260, 140, 280, 120, 300,  # 扩大范围
+            ]
+        
+        log.info(f"🎯 将尝试 {len(distances_to_try)} 个距离: {distances_to_try}")
+        
+        # 尝试每个距离
+        for attempt, distance in enumerate(distances_to_try[:max_attempts], 1):
+            log.info("\n" + "="*60)
+            log.info(f"🎯 尝试 {attempt}/{len(distances_to_try)}: 相对距离 {distance}px")
+            log.info("="*60)
+            
             try:
-                container = page.wait_for_selector(f"xpath={container_xpath}", timeout=5000)
-                if container:
-                    container_box = container.bounding_box()
-                    if container_box:
-                        # 拖动距离 = 容器宽度 - 滑块宽度 - 20px缓冲
-                        distance = int(container_box["width"] - box["width"] - 20)
-                        log.info(f"Calculated drag distance from container: {distance}px")
-            except Exception as e:
-                log.warning(f"Failed to calculate distance from container: {e}")
+                # 重新获取滑块位置（可能已被重置）
+                box = slider_locator.bounding_box(timeout=3000)
+                start_x = box["x"] + box["width"] / 2
+                start_y = box["y"] + box["height"] / 2
+                
+                log.info(f"📐 拖动详情:")
+                log.info(f"   起始位置: ({start_x:.0f}, {start_y:.0f})")
+                log.info(f"   相对移动: +{distance}px")
+                log.info(f"   目标位置: ({start_x + distance:.0f}, {start_y:.0f})")
+                
+                # 生成拟人轨迹
+                track = _human_drag_track(distance)
+                steps = track["steps"]
+                
+                log.info(f"🎬 拟人轨迹: {len(steps)} 步骤")
+                
+                # 执行拖动
+                page.mouse.move(start_x, start_y)
+                time.sleep(random.uniform(0.3, 0.5))
+                page.mouse.down()
+                time.sleep(random.uniform(0.15, 0.25))
+                
+                current_x = start_x
+                for i, step in enumerate(steps):
+                    current_x += step
+                    jitter_y = start_y + random.randint(-2, 2)
+                    page.mouse.move(current_x, jitter_y)
+                    time.sleep(random.uniform(0.015, 0.035))
+                    
+                    # 每10步记录一次
+                    if (i + 1) % 10 == 0 or i == len(steps) - 1:
+                        log.info(f"   进度: {i+1}/{len(steps)}, 当前X={current_x:.0f}")
+                
+                time.sleep(random.uniform(0.2, 0.3))
+                page.mouse.up()
+                
+                actual_distance = current_x - start_x
+                log.info(f"✅ 拖动完成: 实际移动={actual_distance:.0f}px")
+                
+                # 等待验证结果
+                time.sleep(3)
+                
+                # 检查是否成功
+                if code_input_xpath:
+                    try:
+                        code_input_locator = page.locator(f"xpath={code_input_xpath}").first
+                        code_input_locator.wait_for(state="visible", timeout=3000)
+                        log.info("\n" + "="*60)
+                        log.info("🎉🎉 滑块验证成功！")
+                        log.info(f"✅ 成功距离: {distance}px")
+                        log.info(f"✅ 实际移动: {actual_distance:.0f}px")
+                        log.info("="*60 + "\n")
+                        return True
+                    except Exception:
+                        log.warning(f"⚠️ 距离 {distance}px 验证失败")
+                
+                # 失败后尝试刷新验证码
+                if attempt < len(distances_to_try):
+                    log.info("🔄 尝试刷新验证码...")
+                    try:
+                        refresh_btn = slider_frame.locator("xpath=//div[contains(@class, 'refresh')]").first
+                        if refresh_btn.count() > 0:
+                            refresh_btn.click(timeout=2000)
+                            time.sleep(2)
+                            log.info("✅ 验证码已刷新")
+                    except Exception:
+                        log.info("⚠️ 无法刷新验证码")
+                    time.sleep(1)
+                
+            except Exception as drag_err:
+                log.error(f"❌ 拖动失败: {drag_err}")
+                continue
         
-        # 起始位置
-        start_x = box["x"] + box["width"] / 2
-        start_y = box["y"] + box["height"] / 2
-        
-        log.info(f"Starting drag from ({start_x}, {start_y}) with distance {distance}px")
-        
-        # 生成拟人化轨迹
-        track = _human_drag_track(distance)
-        steps = track["steps"]
-        
-        # 开始拖动
-        page.mouse.move(start_x, start_y)
-        time.sleep(random.uniform(0.1, 0.3))  # 模拟人类思考
-        page.mouse.down()
-        time.sleep(random.uniform(0.05, 0.15))  # 按下后稍等
-        
-        current_x = start_x
-        for i, step in enumerate(steps):
-            current_x += step
-            # 添加微小的垂直抖动
-            jitter_y = start_y + random.randint(-2, 2)
-            page.mouse.move(current_x, jitter_y)
-            # 模拟人类拖动的时间间隔
-            time.sleep(random.uniform(0.008, 0.025))
-        
-        # 释放鼠标前稍等
-        time.sleep(random.uniform(0.1, 0.2))
-        page.mouse.up()
-        
-        log.info("Slider drag completed successfully")
-        
-        # 等待验证结果
-        time.sleep(2)
-        return True
+        log.error("❌ 所有尝试均失败")
+        return False
         
     except Exception as e:
-        log.error(f"Slider drag failed: {e}")
-        try:
-            # 尝试截图便于调试
-            page.screenshot(path="slider_error.png")
-            log.info("Screenshot saved to slider_error.png")
-        except Exception:
-            pass
+        log.error(f"❌ 滑块验证失败: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return False
+
+
+def _perform_human_drag(page: Page, slider_xpath: str, container_xpath: Optional[str] = None) -> bool:
+    """
+    废弃函数：请使用 _smart_slider_captcha() 代替
+    保留此函数仅为了向后兼容
+    """
+    log = get_logger(__name__)
+    log.error("❌ _perform_human_drag() 已废弃，请使用 _smart_slider_captcha()")
+    return False
 
 
 def _extract_verification_code(page: Page, code_xpath: str, max_wait: int = 30) -> Optional[str]:
@@ -980,114 +1175,25 @@ def run_registration_flow(
                         
                         time.sleep(3)  # 额外等待让 JavaScript 执行完
                         
-                        # 尝试多个可能的滑块 XPath 和 CSS 选择器
-                        slider_selectors = [
-                            {"type": "xpath", "value": slider_xpath, "desc": "配置的 XPath"},
-                            {"type": "xpath", "value": "//i[@class='btn-icon']", "desc": "i 标签 + class"},
-                            {"type": "xpath", "value": "//*[contains(@class, 'btn-icon')]", "desc": "含有 btn-icon class"},
-                            {"type": "xpath", "value": "//div[@class='slider-btn']/i", "desc": "通过父元素"},
-                            {"type": "xpath", "value": "//div[contains(@class, 'slider-btn')]//i", "desc": "模糊父元素"},
-                            {"type": "css", "value": ".btn-icon", "desc": "CSS class"},
-                            {"type": "css", "value": "i.btn-icon", "desc": "CSS i.btn-icon"},
-                            {"type": "css", "value": ".slider-btn i", "desc": "CSS 父元素"},
-                        ]
+                        # 🎉 使用新的智能滑块验证函数
+                        log.info("\n" + "="*60)
+                        log.info("🦾 开始智能滑块验证（基于相对坐标）")
+                        log.info("="*60)
                         
-                        slider_found = False
-                        for selector in slider_selectors:
-                            try:
-                                sel_type = selector["type"]
-                                sel_value = selector["value"]
-                                sel_desc = selector["desc"]
-                                
-                                log.info(f"🔍 尝试 {sel_type.upper()}: {sel_value} ({sel_desc})")
-                                
-                                # 使用 frame 的 locator 方法
-                                if sel_type == "xpath":
-                                    slider_in_iframe = slider_frame.locator(f"xpath={sel_value}").first
-                                else:  # css
-                                    slider_in_iframe = slider_frame.locator(sel_value).first
-                                
-                                # 等待元素可见
-                                slider_in_iframe.wait_for(state="visible", timeout=8000)
-                                log.info(f"✅ 使用 {sel_type.upper()} 找到滑块: {sel_value}")
-                                slider_found = True
-                                
-                                # 获取滑块位置
-                                box = slider_in_iframe.bounding_box()
-                                if box:
-                                    log.info(f"📍 滑块位置: x={box['x']:.0f}, y={box['y']:.0f}, width={box['width']:.0f}, height={box['height']:.0f}")
-                                    
-                                    # 计算拖动距离（默认300px）
-                                    distance = 300
-                                    
-                                    # 尝试根据容器计算距离
-                                    try:
-                                        container_in_iframe = slider_frame.locator(f"xpath={slider_container_xpath}").first
-                                        container_box = container_in_iframe.bounding_box(timeout=3000)
-                                        if container_box:
-                                            distance = int(container_box["width"] - box["width"] - 20)
-                                            log.info(f"📏 根据容器计算拖动距离: {distance}px")
-                                    except Exception as calc_err:
-                                        log.warning(f"⚠️ 无法计算距离，使用默认值300px: {calc_err}")
-                                    
-                                    # 执行拖动
-                                    start_x = box["x"] + box["width"] / 2
-                                    start_y = box["y"] + box["height"] / 2
-                                    end_x = start_x + distance
-                                    
-                                    log.info(f"👉 开始拖动: ({start_x:.0f}, {start_y:.0f}) -> ({end_x:.0f}, {start_y:.0f}) [距离: {distance}px]")
-                                    
-                                    # 生成拟人轨迹
-                                    track = _human_drag_track(distance)
-                                    steps = track["steps"]
-                                    
-                                    # 使用主页面的mouse，因为坐标是相对于整个页面的
-                                    page.mouse.move(start_x, start_y)
-                                    time.sleep(random.uniform(0.2, 0.4))
-                                    page.mouse.down()
-                                    time.sleep(random.uniform(0.1, 0.2))
-                                    
-                                    current_x = start_x
-                                    for step in steps:
-                                        current_x += step
-                                        jitter_y = start_y + random.randint(-2, 2)
-                                        page.mouse.move(current_x, jitter_y)
-                                        time.sleep(random.uniform(0.015, 0.035))
-                                    
-                                    time.sleep(random.uniform(0.2, 0.3))
-                                    page.mouse.up()
-                                    
-                                    log.info("✅ 滑块拖动完成")
-                                    time.sleep(5)  # 等待验证结果
-                                    
-                                    # 验证是否成功：检查验证码输入框是否出现
-                                    code_input_xpath = xpaths.get("code_url_element")
-                                    if code_input_xpath and element_exists(code_input_xpath, timeout_ms=5000):
-                                        log.info("✅✅ 滑块验证成功！验证码输入框已出现")
-                                        slider_solved = True
-                                    else:
-                                        log.warning("⚠️ 滑块拖动完成，但验证码输入框未出现")
-                                        log.info("🔄 尝试重新拖动...")
-                                        # 不设置 slider_solved = True，继续尝试下一个选择器
-                                        continue
-                                    
-                                    break  # 找到滑块并验证成功后跳出循环
-                                else:
-                                    log.error("❌ 无法获取滑块位置")
-                                    
-                            except Exception as slider_err:
-                                log.warning(f"⚠️ {selector['type'].upper()} '{selector['value']}' 查找失败: {slider_err}")
-                                continue
+                        code_input_xpath = xpaths.get("code_url_element")
+                        slider_success = _smart_slider_captcha(
+                            slider_frame=slider_frame,
+                            page=page,
+                            slider_xpath=slider_xpath,
+                            code_input_xpath=code_input_xpath,
+                            max_attempts=10
+                        )
                         
-                        if not slider_found:
-                            log.error("❌ 所有选择器都失败了")
-                            # 保存调试截图
-                            try:
-                                debug_shot = runtime_dir / f"slider_not_found_{int(time.time()*1000)}.png"
-                                page.screenshot(path=str(debug_shot))
-                                log.info(f"📸 调试截图已保存: {debug_shot}")
-                            except Exception:
-                                pass
+                        if slider_success:
+                            log.info("✅✅ 滑块验证成功！")
+                            slider_solved = True
+                        else:
+                            log.error("❌ 滑块验证失败")
                             
                     except Exception as iframe_err:
                         log.error(f"❌ iframe处理失败: {iframe_err}")
