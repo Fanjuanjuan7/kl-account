@@ -335,34 +335,25 @@ def _smart_slider_captcha(
                 log.info(f"✅ 拖动完成: 实际移动={actual_distance:.0f}px")
                 
                 # 等待验证结果
-                time.sleep(3)
+                time.sleep(6)  # 增加等待时间让iframe有时间关闭
                 
-                # 检查是否成功
+                # 🔴 关键：检查主页面上的验证码输入框（不是iframe）
                 if code_input_xpath:
                     try:
+                        # 在主页面上查找验证码输入框
                         code_input_locator = page.locator(f"xpath={code_input_xpath}").first
-                        code_input_locator.wait_for(state="visible", timeout=3000)
+                        code_input_locator.wait_for(state="visible", timeout=5000)
                         log.info("\n" + "="*60)
-                        log.info("🎉🎉 滑块验证成功！")
+                        log.info("🎉🎉 滑块验证成功！验证码输入框已出现")
                         log.info(f"✅ 成功距离: {distance}px")
                         log.info(f"✅ 实际移动: {actual_distance:.0f}px")
                         log.info("="*60 + "\n")
                         return True
-                    except Exception:
-                        log.warning(f"⚠️ 距离 {distance}px 验证失败")
-                
-                # 失败后尝试刷新验证码
-                if attempt < len(distances_to_try):
-                    log.info("🔄 尝试刷新验证码...")
-                    try:
-                        refresh_btn = slider_frame.locator("xpath=//div[contains(@class, 'refresh')]").first
-                        if refresh_btn.count() > 0:
-                            refresh_btn.click(timeout=2000)
-                            time.sleep(2)
-                            log.info("✅ 验证码已刷新")
-                    except Exception:
-                        log.info("⚠️ 无法刷新验证码")
-                    time.sleep(1)
+                    except Exception as check_err:
+                        log.warning(f"⚠️ 距离 {distance}px 验证失败: {check_err}")
+                        # 失败后不要继续尝试，因为iframe可能已关闭
+                        log.error("❌ 验证失败，停止尝试")
+                        return False
                 
             except Exception as drag_err:
                 log.error(f"❌ 拖动失败: {drag_err}")
