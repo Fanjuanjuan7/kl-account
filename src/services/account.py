@@ -252,7 +252,7 @@ def register_accounts_batch(
     interval_ms: int = 300,
     bitbrowser_base_url: Optional[str] = None,
     platform_url: Optional[str] = None,
-    group_id: Optional[str] = None,
+    bitbrowser_password: Optional[str] = None,  # 比特浏览器密码
     auto_xpaths: Optional[Dict[str, str]] = None,
     dry_run: bool = False,  # 默认改为False，启用真实自动化
     browser_mode: str = "bitbrowser",  # 浏览器模式: bitbrowser 或 playwright
@@ -365,136 +365,157 @@ def register_accounts_batch(
     ok, fail = 0, 0
     outputs: List[str] = []
     
-    log.info(f"Starting batch registration for {len(rows)} accounts")
+    log.info(f"开始批量注册 {len(rows)} 个账号，并发数: {concurrency}")
     
-    for idx, rec in enumerate(rows, 1):
+    # 🔴 使用线程池实现并发执行
+    def process_account(idx: int, rec: Dict[str, Any]) -> Tuple[bool, str, str, Optional[str]]:
+        """
+        处理单个账号注册
+        返回: (success, email, message, window_id)
+        """
         email = rec.get("email")
         password = rec.get("password")
-        code_url = rec.get("code_url")  # 邮箱验证码接码地址
+        code_url = rec.get("code_url")
+        window_id = None
         
         log.info(f"\n{'='*60}")
-        log.info(f"Processing account {idx}/{len(rows)}: {email}")
+        log.info(f"处理账号 {idx}/{len(rows)}: {email}")
         log.info(f"{'='*60}")
-        payload: Dict[str, Any] = {
-            "groupId": group_id or "",
-            "userName": email,
-            "password": password,
-            "url": platform_url or "https://klingai.com",  # 使用klingai.com而不是app.klingai.com
-            "proxyMethod": 2,
-            "browserFingerPrint": {},
-        }
-        # 依据 CSV 每账号代理信息设置代理：默认 socks5
-        host = rec.get("host")
-        port = rec.get("port")
-        puser = rec.get("proxyUserName")
-        ppass = rec.get("proxyPassword")
-        if host and port:
-            payload.update({
-                "proxyType": "socks5",
-                "host": host,
-                "port": int(port),
-            })
-            if puser:
-                payload["proxyUserName"] = puser
-            if ppass:
-                payload["proxyPassword"] = ppass
+        
         try:
+            payload: Dict[str, Any] = {
+                "userName": email,
+                "password": password,
+                "url": platform_url or "https://klingai.com",
+                "proxyMethod": 2,
+                "browserFingerPrint": {},
+            }
+            # 设置代理
+            host = rec.get("host")
+            port = rec.get("port")
+            puser = rec.get("proxyUserName")
+            ppass = rec.get("proxyPassword")
+            if host and port:
+                payload.update({
+                    "proxyType": "socks5",
+                    "host": host,
+                    "port": int(port),
+                })
+                if puser:
+                    payload["proxyUserName"] = puser
+                if ppass:
+                    payload["proxyPassword"] = ppass
+            
+            # 创建窗口
             r = client.create_window(payload)
-            if r.get("success"):
-                data = r.get("data", {})
-                wid = data.get("id") or ""
-                try:
-                    if wid:
-                        # 打开比特浏览器窗口
-                        open_result = client.open_window(wid)
-                        log.info(f"Window opened for {email}: {open_result}")
-                        
-                        # 等待窗口完全打开
-                        log.info("Waiting for window to fully initialize...")
-                        time.sleep(5)  # 增加等待时间让窗口充分加载
-                        
-                        # 注：比特浏览器API可能不支持maximize/activate等方法，跳过这些操作
-                except Exception as e:
-                    # 记录错误但继续执行
-                    log.warning(f"Failed to setup browser window for {email}: {e}")
-                    pass
-                # 自动化注册流程
-                # 获取 DevTools WebSocket（用于Playwright附着）
-                ws = None
-                try:
-                    log.info(f"Getting DevTools WebSocket for window {wid}...")
-                    # 比特浏览器API返回WebSocket地址的方式可能是在open_window的返回值中
-                    if open_result.get("success"):
-                        ws_data = open_result.get("data", {})
-                        ws = ws_data.get("ws") or ws_data.get("webSocketDebuggerUrl")
-                        if ws:
-                            log.info(f"✅ Got WebSocket from open_window: {ws}")
+            if not r.get("success"):
+                return (False, email, f"FAIL: {r.get('msg')}", None)
+            
+            data = r.get("data", {})
+            window_id = data.get("id") or ""
+            if not window_id:
+                return (False, email, "FAIL: No window ID", None)
+            
+            # 打开窗口
+            open_result = client.open_window(window_id)
+            log.info(f"Window opened for {email}: {open_result}")
+            time.sleep(5)
+            
+            # 获取WebSocket
+            ws = None
+            if open_result.get("success"):
+                ws_data = open_result.get("data", {})
+                ws = ws_data.get("ws") or ws_data.get("webSocketDebuggerUrl")
+                if ws:
+                    log.info(f"✅ Got WebSocket: {ws}")
+                else:
+                    if "http" in ws_data.get("http", ""):
+                        http_url = ws_data.get("http")
+                        import re
+                        port_match = re.search(r':(\d+)', http_url)
+                        if port_match:
+                            port = port_match.group(1)
+                            ws = f"ws://127.0.0.1:{port}/devtools/browser"
+                            log.info(f"✅ Constructed WebSocket: {ws}")
+            
+            # 执行自动化注册
+            auto_ok = run_registration_flow(
+                email=email,
+                password=password,
+                runtime_dir=runtime_dir,
+                xpaths=auto_xpaths or {},
+                proxy={
+                    "host": host,
+                    "port": port,
+                    "username": puser,
+                    "password": ppass,
+                },
+                platform_url=platform_url or "https://klingai.com",
+                code_url=code_url,
+                attach_ws=ws,
+                dry_run=dry_run,
+                browser_mode=browser_mode,
+            )
+            
+            if auto_ok:
+                return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
+            else:
+                # 注册失败，删除窗口
+                if window_id:
+                    try:
+                        log.info(f"🗑️ 注册失败，删除窗口: {window_id}")
+                        delete_result = client.delete_window(window_id, bitbrowser_password)
+                        if delete_result.get("success"):
+                            log.info(f"✅ 窗口已删除: {window_id}")
                         else:
-                            log.info(f"Open window data: {ws_data}")
-                            # 如果没有ws，尝试直接构造WebSocket URL
-                            # 比特浏览器通常使用: ws://127.0.0.1:port/devtools/browser/{wid}
-                            if "http" in ws_data.get("http", ""):
-                                http_url = ws_data.get("http")
-                                # 从httpURL提取端口
-                                import re
-                                port_match = re.search(r':(\d+)', http_url)
-                                if port_match:
-                                    port = port_match.group(1)
-                                    ws = f"ws://127.0.0.1:{port}/devtools/browser"
-                                    log.info(f"✅ Constructed WebSocket: {ws}")
-                    
-                    if not ws:
-                        log.warning("⚠️ No WebSocket available, will launch new browser")
-                        
-                except Exception as e:
-                    log.error(f"Failed to get WebSocket: {e}")
-                    import traceback
-                    log.error(traceback.format_exc())
-                    ws = None
-
-                auto_ok = run_registration_flow(
-                    email=email,
-                    password=password,
-                    runtime_dir=runtime_dir,
-                    xpaths=auto_xpaths or {},
-                    proxy={
-                        "host": host,
-                        "port": port,
-                        "username": puser,
-                        "password": ppass,
-                    },
-                    platform_url=platform_url or "https://klingai.com",
-                    code_url=code_url,
-                    attach_ws=ws,
-                    dry_run=dry_run,
-                    browser_mode=browser_mode,  # 传递浏览器模式
-                )
+                            log.warning(f"⚠️ 删除窗口失败: {delete_result.get('msg')}")
+                    except Exception as del_err:
+                        log.error(f"❌ 删除窗口异常: {del_err}")
+                return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", None)
                 
-                if auto_ok:
+        except Exception as e:
+            # 异常时也尝试删除窗口
+            if window_id:
+                try:
+                    log.info(f"🗑️ 异常发生，删除窗口: {window_id}")
+                    client.delete_window(window_id, bitbrowser_password)
+                except Exception:
+                    pass
+            return (False, email, f"ERROR {email}: {e}", None)
+    
+    # 使用线程池并发执行
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        futures = {}
+        for idx, rec in enumerate(rows, 1):
+            future = executor.submit(process_account, idx, rec)
+            futures[future] = rec.get("email")
+            time.sleep(interval_ms / 1000.0)  # 间隔提交
+        
+        # 等待所有任务完成
+        for future in as_completed(futures):
+            email = futures[future]
+            try:
+                success, result_email, message, window_id = future.result()
+                outputs.append(message)
+                
+                if success:
                     ok += 1
-                    success_msg = f"SUCCESS {idx}/{len(rows)}: {email}"
-                    outputs.append(success_msg)
-                    log.info(f"\u2705 {success_msg}")
+                    log.info(f"✅ {message}")
+                    update_csv_status(csv_path, result_email, "成功")
                 else:
                     fail += 1
-                    fail_msg = f"FAIL {idx}/{len(rows)}: {email} - automation failed"
-                    outputs.append(fail_msg)
-                    log.error(f"\u274c {fail_msg}")
-            else:
+                    log.error(f"❌ {message}")
+                    update_csv_status(csv_path, result_email, "失败")
+            except Exception as e:
                 fail += 1
-                outputs.append(f"FAIL {email}: {r.get('msg')}")
-                
-                # 更新CSV状态为"失败"
+                error_msg = f"ERROR {email}: {e}"
+                outputs.append(error_msg)
+                log.error(error_msg)
                 update_csv_status(csv_path, email, "失败")
-        except Exception as e:
-            fail += 1
-            outputs.append(f"ERROR {email}: {e}")
-            
-            # 更新CSV状态为"失败"
-            update_csv_status(csv_path, email, "失败")
-        time.sleep(interval_ms / 1000.0)
     
     # 最终统计
     summary = f"\n{'='*60}\nBatch Registration Complete\n{'='*60}\nTotal: {len(rows)} | Success: {ok} | Failed: {fail}\n{'='*60}"
     log.info(summary)
     return "\n".join(outputs + [summary])
+
+

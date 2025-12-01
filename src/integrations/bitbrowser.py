@@ -28,6 +28,19 @@ class BitBrowserClient:
 
     def close_window(self, window_id: str) -> Dict[str, Any]:
         return self.post("/browser/close", {"id": window_id})
+    
+    def delete_window(self, window_id: str, password: Optional[str] = None) -> Dict[str, Any]:
+        """
+        删除窗口（永久删除）
+        
+        参数：
+            window_id: 窗口ID
+            password: 比特浏览器密码（如果需要）
+        """
+        payload = {"id": window_id}
+        if password:
+            payload["password"] = password
+        return self.post("/browser/delete", payload)
 
     def list_windows(self) -> Dict[str, Any]:
         return self.get("/browser/list")

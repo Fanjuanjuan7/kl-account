@@ -98,10 +98,10 @@ class KLZhanghaoApp(ctk.CTk):
         )
         self.browser_mode_combo.grid(row=0, column=3, padx=5, pady=5, sticky="w")
         
-        # groupId
-        ctk.CTkLabel(config_frame, text="GroupId:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.group_entry = ctk.CTkEntry(config_frame, placeholder_text="可选")
-        self.group_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        # 比特浏览器密码（替换groupId）
+        ctk.CTkLabel(config_frame, text="比特浏览器密码:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.bitbrowser_password_entry = ctk.CTkEntry(config_frame, placeholder_text="删除窗口时需要（可选）", show="*")
+        self.bitbrowser_password_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
         
         # 平台URL
         ctk.CTkLabel(config_frame, text="平台URL:").grid(row=1, column=2, padx=5, pady=5, sticky="w")
@@ -193,12 +193,12 @@ class KLZhanghaoApp(ctk.CTk):
         if choice == "playwright":
             # Playwright模式下禁用比特浏览器API输入
             self.api_entry.configure(state="disabled")
-            self.group_entry.configure(state="disabled")
+            self.bitbrowser_password_entry.configure(state="disabled")
             self.update_status("已切换到Playwright模式（本地浏览器+随机指纹）", "blue")
         else:
             # 比特浏览器模式
             self.api_entry.configure(state="normal")
-            self.group_entry.configure(state="normal")
+            self.bitbrowser_password_entry.configure(state="normal")
             self.update_status("已切换到比特浏览器模式", "blue")
     
     def load_csv(self):
@@ -244,10 +244,46 @@ class KLZhanghaoApp(ctk.CTk):
         with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
             sample = f.read(2048)
             f.seek(0)
+            
+            # 尝试自动检测CSV格式
+            dialect = None
             try:
-                dialect = csv.Sniffer().sniff(sample)
-            except Exception:
+                detected_dialect = csv.Sniffer().sniff(sample)
+                # 验证分隔符是否有效：必须是单字符且是常见分隔符
+                valid_delimiters = [',', '\t', ';', '|']
+                if (hasattr(detected_dialect, 'delimiter') and 
+                    len(detected_dialect.delimiter) == 1 and
+                    detected_dialect.delimiter in valid_delimiters):
+                    dialect = detected_dialect
+                    self.log.info(f"✅ 检测到CSV分隔符: '{detected_dialect.delimiter}'")
+                else:
+                    invalid_delim = getattr(detected_dialect, 'delimiter', 'unknown')
+                    self.log.warning(f"⚠️ 检测到无效分隔符: '{invalid_delim}'，将尝试其他方式")
+            except Exception as e:
+                self.log.warning(f"⚠️ CSV格式检测失败: {e}，将使用默认格式")
+            
+            # 如果自动检测失败，尝试常见分隔符
+            if dialect is None:
+                for delim in [',', '\t', ';', '|']:
+                    f.seek(0)
+                    try:
+                        test_reader = csv.reader(f, delimiter=delim)
+                        first_row = next(test_reader)
+                        if len(first_row) > 1:  # 至少有2列
+                            f.seek(0)
+                            dialect = csv.excel
+                            dialect.delimiter = delim
+                            self.log.info(f"✅ 使用分隔符: '{delim}'")
+                            break
+                    except Exception:
+                        continue
+            
+            # 如果还是没找到，使用默认逗号
+            if dialect is None:
                 dialect = csv.excel
+                self.log.info("⚠️ 使用默认逗号分隔符")
+            
+            f.seek(0)
             reader = csv.reader(f, dialect)
             for row in reader:
                 rows.append(row)
@@ -316,7 +352,7 @@ class KLZhanghaoApp(ctk.CTk):
                     interval_ms=int(self.interval_var.get()),
                     bitbrowser_base_url=self.api_entry.get() or None,
                     platform_url=self.url_entry.get() or None,
-                    group_id=self.group_entry.get() or None,
+                    bitbrowser_password=self.bitbrowser_password_entry.get() or None,  # 比特浏览器密码
                     auto_xpaths=xjson,
                     dry_run=not auto or not bool(xjson),
                     browser_mode="bitbrowser",
@@ -337,7 +373,7 @@ class KLZhanghaoApp(ctk.CTk):
                 "csv_path": self.csv_entry.get(),
                 "api_base": self.api_entry.get(),
                 "platform_url": self.url_entry.get(),
-                "group_id": self.group_entry.get(),
+                "bitbrowser_password": self.bitbrowser_password_entry.get(),  # 保存比特浏览器密码
                 "concurrency": int(self.concurrency_var.get()),
                 "interval_ms": int(self.interval_var.get()),
                 "auto": self.auto_var.get(),
@@ -375,8 +411,8 @@ class KLZhanghaoApp(ctk.CTk):
         self.url_entry.delete(0, "end")
         self.url_entry.insert(0, self.cfg.get("platform_url", "https://klingai.com"))
         
-        self.group_entry.delete(0, "end")
-        self.group_entry.insert(0, self.cfg.get("group_id", ""))
+        self.bitbrowser_password_entry.delete(0, "end")
+        self.bitbrowser_password_entry.insert(0, self.cfg.get("bitbrowser_password", ""))
         
         self.concurrency_var.set(str(self.cfg.get("concurrency", 3)))
         self.interval_var.set(str(self.cfg.get("interval_ms", 300)))

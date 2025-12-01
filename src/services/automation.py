@@ -1166,9 +1166,9 @@ def run_registration_flow(
                         
                         time.sleep(3)  # 额外等待让 JavaScript 执行完
                         
-                        # 🎉 使用新的智能滑块验证函数 - 最多重试5次
+                        # 🎉 使用新的智能滑块验证函数 - 最多重试10次
                         code_input_xpath = xpaths.get("code_url_element")
-                        max_retry_attempts = 5
+                        max_retry_attempts = 10  # 🔴 从max5次增加到10次
                         slider_success = False
                         
                         for retry_count in range(max_retry_attempts):
