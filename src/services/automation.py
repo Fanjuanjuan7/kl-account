@@ -1166,25 +1166,87 @@ def run_registration_flow(
                         
                         time.sleep(3)  # 额外等待让 JavaScript 执行完
                         
-                        # 🎉 使用新的智能滑块验证函数
-                        log.info("\n" + "="*60)
-                        log.info("🦾 开始智能滑块验证（基于相对坐标）")
-                        log.info("="*60)
-                        
+                        # 🎉 使用新的智能滑块验证函数 - 最多重试5次
                         code_input_xpath = xpaths.get("code_url_element")
-                        slider_success = _smart_slider_captcha(
-                            slider_frame=slider_frame,
-                            page=page,
-                            slider_xpath=slider_xpath,
-                            code_input_xpath=code_input_xpath,
-                            max_attempts=10
-                        )
+                        max_retry_attempts = 5
+                        slider_success = False
                         
-                        if slider_success:
-                            log.info("✅✅ 滑块验证成功！")
-                            slider_solved = True
-                        else:
-                            log.error("❌ 滑块验证失败")
+                        for retry_count in range(max_retry_attempts):
+                            log.info("\n" + "="*60)
+                            log.info(f"🦾 开始智能滑块验证（基于相对坐标）- 尝试 {retry_count + 1}/{max_retry_attempts}")
+                            log.info("="*60)
+                            
+                            slider_success = _smart_slider_captcha(
+                                slider_frame=slider_frame,
+                                page=page,
+                                slider_xpath=slider_xpath,
+                                code_input_xpath=code_input_xpath,
+                                max_attempts=1  # 每次重试只尝试一个距离
+                            )
+                            
+                            if slider_success:
+                                log.info(f"✅✅ 滑块验证成功！（第{retry_count + 1}次尝试）")
+                                slider_solved = True
+                                break
+                            else:
+                                log.warning(f"⚠️ 第{retry_count + 1}次滑块验证失败")
+                                
+                                # 如果还有重试机会，等待iframe自动刷新验证码
+                                if retry_count < max_retry_attempts - 1:
+                                    log.info("🔄 滑块验证系统会自动刷新，等待iframe内容更新...")
+                                    try:
+                                        # 🔴 不刷新整个页面，只等待iframe自动刷新
+                                        # 等待一段时间让验证码系统自动刷新
+                                        log.info("⏳ 等待5秒让验证码系统自动刷新...")
+                                        time.sleep(5)
+                                        
+                                        # 检查iframe是否仍然存在
+                                        log.info("🔍 检查iframe状态...")
+                                        iframe_locator = page.locator("xpath=//iframe[contains(@src, 'captcha')]").first
+                                        
+                                        # 等待iframe元素存在
+                                        try:
+                                            iframe_locator.wait_for(state="attached", timeout=10000)
+                                            log.info("✅ iframe仍然存在")
+                                        except Exception:
+                                            log.warning("⚠️ iframe已消失，重新查找...")
+                                            time.sleep(2)
+                                            iframe_locator.wait_for(state="attached", timeout=10000)
+                                        
+                                        # 重新获取frame对象（iframe可能已经内部刷新）
+                                        all_frames = page.frames
+                                        slider_frame = None
+                                        for frame in all_frames:
+                                            if "captcha" in frame.url.lower():
+                                                slider_frame = frame
+                                                log.info(f"✅ 确认iframe: {frame.url[:80]}")
+                                                break
+                                        
+                                        if not slider_frame:
+                                            log.error("❌ 无法找到iframe")
+                                            break
+                                        
+                                        # 等待iframe内容完全加载（新验证码图片）
+                                        try:
+                                            slider_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                                            log.info("✅ iframe DOM已加载")
+                                        except Exception:
+                                            log.warning("⚠️ DOM加载超时，但继续尝试")
+                                        
+                                        # 额外等待让JavaScript执行完
+                                        time.sleep(3)
+                                        log.info("✅ iframe已更新，准备下一次尝试")
+                                        
+                                    except Exception as refresh_err:
+                                        log.error(f"❌ iframe刷新等待失败: {refresh_err}")
+                                        import traceback
+                                        log.error(traceback.format_exc())
+                                        break
+                                else:
+                                    log.error(f"❌ 已达到最大重试次数({max_retry_attempts})，滑块验证失败")
+                        
+                        if not slider_success:
+                            log.error("❌ 所有滑块验证尝试均失败")
                             
                     except Exception as iframe_err:
                         log.error(f"❌ iframe处理失败: {iframe_err}")

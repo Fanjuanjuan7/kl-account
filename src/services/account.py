@@ -8,6 +8,69 @@ from ..integrations.bitbrowser import BitBrowserClient
 from .automation import run_registration_flow
 
 
+def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
+    """
+    更新CSV文件中指定邮箱的注册状态（第9列）
+    
+    参数：
+        csv_path: CSV文件路径
+        email: 邮箱地址
+        status: 状态值（"成功" 或 "失败"）
+    
+    返回：
+        更新成功返回True，否则返回False
+    """
+    log = get_logger(__name__)
+    
+    try:
+        # 读取所有行
+        rows = []
+        with csv_path.open("r", encoding="utf-8-sig", newline='') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        
+        if not rows:
+            log.error("CSV文件为空")
+            return False
+        
+        # 确定是否有标题行
+        has_header = rows[0] and "email" in rows[0][0].lower()
+        start_row = 1 if has_header else 0
+        
+        # 查找并更新对应行
+        updated = False
+        for i in range(start_row, len(rows)):
+            row = rows[i]
+            if len(row) >= 1 and row[0].strip() == email:
+                # 扩展行到至少9列
+                while len(row) < 9:
+                    row.append("")
+                # 更新第9列（索引8）
+                row[8] = status
+                rows[i] = row
+                updated = True
+                log.info(f"✅ 已更新 {email} 的状态为: {status}")
+                break
+        
+        if not updated:
+            log.warning(f"⚠️ 未找到邮箱 {email} 对应的行")
+            return False
+        
+        # 写回文件
+        with csv_path.open("w", encoding="utf-8-sig", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+        
+        log.info(f"✅ CSV文件已更新: {csv_path}")
+        return True
+        
+    except Exception as e:
+        log.error(f"❌ 更新CSV状态失败: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return False
+
+
 def load_accounts_csv(csv_path: Path) -> List[Dict[str, Any]]:
     # 加载账号与代理（可选）列表
     # CSV格式：邮箱账号、邮箱密码、邮箱验证码接码地址、代理ip、代理端口、代理用户名、代理密码
@@ -243,15 +306,24 @@ def register_accounts_batch(
                     success_msg = f"SUCCESS {idx}/{len(rows)}: {email}"
                     outputs.append(success_msg)
                     log.info(f"✅ {success_msg}")
+                    
+                    # 更新CSV状态为"成功"
+                    update_csv_status(csv_path, email, "成功")
                 else:
                     fail += 1
                     fail_msg = f"FAIL {idx}/{len(rows)}: {email} - automation failed"
                     outputs.append(fail_msg)
                     log.error(f"❌ {fail_msg}")
+                    
+                    # 更新CSV状态为"失败"
+                    update_csv_status(csv_path, email, "失败")
             except Exception as e:
                 fail += 1
                 outputs.append(f"ERROR {idx}/{len(rows)}: {email}: {e}")
                 log.error(f"ERROR processing {email}: {e}")
+                
+                # 更新CSV状态为"失败"
+                update_csv_status(csv_path, email, "失败")
             
             time.sleep(interval_ms / 1000.0)
         
@@ -411,9 +483,15 @@ def register_accounts_batch(
             else:
                 fail += 1
                 outputs.append(f"FAIL {email}: {r.get('msg')}")
+                
+                # 更新CSV状态为"失败"
+                update_csv_status(csv_path, email, "失败")
         except Exception as e:
             fail += 1
             outputs.append(f"ERROR {email}: {e}")
+            
+            # 更新CSV状态为"失败"
+            update_csv_status(csv_path, email, "失败")
         time.sleep(interval_ms / 1000.0)
     
     # 最终统计
