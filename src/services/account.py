@@ -458,12 +458,35 @@ def register_accounts_batch(
             )
             
             if auto_ok:
-                return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
-            else:
-                # 注册失败，删除窗口
+                # 注册成功，关闭窗口
                 if window_id:
                     try:
-                        log.info(f"🗑️ 注册失败，删除窗口: {window_id}")
+                        log.info(f"✅ 注册成功，关闭窗口: {window_id}")
+                        close_result = client.close_window(window_id)
+                        if close_result.get("success"):
+                            log.info(f"✅ 窗口已关闭: {window_id}")
+                        else:
+                            log.warning(f"⚠️ 关闭窗口失败: {close_result.get('msg')}")
+                    except Exception as close_err:
+                        log.error(f"❌ 关闭窗口异常: {close_err}")
+                return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
+            else:
+                # 注册失败，关闭并删除窗口
+                if window_id:
+                    try:
+                        log.info(f"🗑️ 注册失败，关闭并删除窗口: {window_id}")
+                        
+                        # 先关闭窗口
+                        try:
+                            close_result = client.close_window(window_id)
+                            if close_result.get("success"):
+                                log.info(f"✅ 窗口已关闭: {window_id}")
+                            else:
+                                log.warning(f"⚠️ 关闭窗口失败: {close_result.get('msg')}")
+                        except Exception as close_err:
+                            log.warning(f"⚠️ 关闭窗口异常: {close_err}")
+                        
+                        # 再删除窗口
                         delete_result = client.delete_window(window_id, bitbrowser_password)
                         if delete_result.get("success"):
                             log.info(f"✅ 窗口已删除: {window_id}")
@@ -474,11 +497,24 @@ def register_accounts_batch(
                 return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", None)
                 
         except Exception as e:
-            # 异常时也尝试删除窗口
+            # 异常时也尝试关闭并删除窗口
             if window_id:
                 try:
-                    log.info(f"🗑️ 异常发生，删除窗口: {window_id}")
-                    client.delete_window(window_id, bitbrowser_password)
+                    log.info(f"❌ 异常发生，关闭并删除窗口: {window_id}")
+                    
+                    # 先关闭窗口
+                    try:
+                        client.close_window(window_id)
+                        log.info(f"✅ 窗口已关闭: {window_id}")
+                    except Exception:
+                        pass
+                    
+                    # 再删除窗口
+                    try:
+                        client.delete_window(window_id, bitbrowser_password)
+                        log.info(f"✅ 窗口已删除: {window_id}")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             return (False, email, f"ERROR {email}: {e}", None)
