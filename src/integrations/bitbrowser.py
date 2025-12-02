@@ -3,9 +3,17 @@ import httpx
 
 
 class BitBrowserClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, timeout: float = 60.0):
+        """
+        初始化比特浏览器客户端
+        
+        参数：
+            base_url: 比特浏览器API地址
+            timeout: 请求超时时间（秒），默认60秒
+        """
         self.base = base_url.rstrip("/")
-        self._client = httpx.Client(timeout=20)
+        # 增加超时时间到60秒，避免打开窗口时超时
+        self._client = httpx.Client(timeout=timeout)
 
     def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
         r = self._client.post(f"{self.base}{path}", json=json)

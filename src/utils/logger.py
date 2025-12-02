@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 
 
@@ -13,11 +14,19 @@ def init_logging(log_file: Path):
 
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    ch = logging.StreamHandler()
+    # 控制台处理器 - 使用UTF-8编码
+    ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
+    # 设置UTF-8编码，避免Windows GBK编码问题
+    if hasattr(ch.stream, 'reconfigure'):
+        try:
+            ch.stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     logger.addHandler(ch)
 
-    fh = logging.FileHandler(str(log_file))
+    # 文件处理器 - 使用UTF-8编码
+    fh = logging.FileHandler(str(log_file), encoding='utf-8')
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
