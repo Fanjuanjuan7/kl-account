@@ -1,17 +1,17 @@
 @echo off
-REM Windows双击启动文件
-REM 设置UTF-8编码
-chcp 65001 > nul
+REM Windows Double-Click Launcher
+REM Sets UTF-8 encoding
+chcp 65001 > nul 2>&1
 
-REM 获取脚本所在目录
+REM Change to script directory
 cd /d "%~dp0"
 
-REM 执行PowerShell启动脚本
-powershell -ExecutionPolicy Bypass -File "%~dp0start.ps1"
+REM Execute main startup script
+call "%~dp0start.bat"
 
-REM 暂停以查看错误信息
+REM Pause on error
 if errorlevel 1 (
     echo.
-    echo 按任意键退出...
+    echo Press any key to exit...
     pause > nul
 )

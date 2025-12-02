@@ -1,90 +1,110 @@
 @echo off
-REM KL-zhanghao 一键启动脚本 (Windows CMD)
-REM 支持双击运行，自动处理路径和虚拟环境
+REM KL-zhanghao Startup Script for Windows
+REM Auto-activate virtual environment and launch GUI
 
-chcp 65001 > nul
+chcp 65001 > nul 2>&1
 setlocal enabledelayedexpansion
 
-REM 获取脚本所在目录并切换到该目录
+REM Change to script directory
 cd /d "%~dp0"
 
 echo ================================================
-echo   KL-zhanghao 可灵AI账号批量注册工具
+echo   KL-zhanghao Batch Registration Tool
 echo ================================================
 echo.
-echo 工作目录: %CD%
+echo Working Directory: %CD%
 echo.
 
-REM 检查Python版本
+REM Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到Python
-    echo 请先安装Python 3.10或更高版本
+    echo [ERROR] Python not found
+    echo Please install Python 3.10 or higher
     echo.
-    echo 按任意键退出...
+    echo Press any key to exit...
     pause > nul
     exit /b 1
 )
 
 for /f "tokens=*" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i
-echo [OK] Python版本: %PYTHON_VERSION%
+echo [OK] Python Version: %PYTHON_VERSION%
 
-REM 检查虚拟环境
+REM Check virtual environment
 if not exist ".venv" (
     echo.
-    echo [提示] 首次运行，正在创建虚拟环境并安装依赖...
-    echo [等待] 这可能需要几分钟时间，请稍候...
+    echo [INFO] First run - Installing dependencies...
+    echo [WAIT] This may take a few minutes...
     echo.
     
-    REM 运行安装脚本
-    call "%~dp0scripts\install.bat"
-    
+    REM Create virtual environment
+    echo Creating virtual environment...
+    python -m venv .venv
     if errorlevel 1 (
+        echo [ERROR] Failed to create virtual environment
         echo.
-        echo [错误] 安装失败，请检查错误信息
-        echo.
-        echo 按任意键退出...
+        echo Press any key to exit...
         pause > nul
         exit /b 1
     )
     
+    REM Activate and install
+    call .venv\Scripts\activate.bat
+    
+    echo Upgrading pip...
+    python -m pip install --upgrade pip --quiet
+    
+    echo Installing requirements...
+    pip install -r requirements.txt --quiet
+    if errorlevel 1 (
+        echo [ERROR] Failed to install requirements
+        echo.
+        echo Press any key to exit...
+        pause > nul
+        exit /b 1
+    )
+    
+    echo Installing Playwright browsers...
+    python -m playwright install chromium --quiet
+    if errorlevel 1 (
+        echo [WARNING] Playwright installation failed
+    )
+    
     echo.
-    echo [OK] 安装完成！
+    echo [OK] Installation complete!
     echo.
 )
 
-REM 激活虚拟环境
-echo [提示] 激活虚拟环境...
+REM Activate virtual environment
+echo [INFO] Activating virtual environment...
 if exist ".venv\Scripts\activate.bat" (
     call .venv\Scripts\activate.bat
-    echo [OK] 虚拟环境已激活
+    echo [OK] Virtual environment activated
 ) else (
-    echo [错误] 虚拟环境未找到
-    echo 请删除.venv目录后重新运行此脚本
+    echo [ERROR] Virtual environment not found
+    echo Please delete .venv folder and run again
     echo.
-    echo 按任意键退出...
+    echo Press any key to exit...
     pause > nul
     exit /b 1
 )
 
-REM 启动GUI程序
+REM Launch GUI
 echo.
-echo [启动] 启动GUI程序...
+echo [START] Launching GUI...
 echo ================================================
 echo.
 
-REM 使用python -m确保模块正确导入
 python -m src.app.main
 
 set EXIT_CODE=%errorlevel%
 
 echo.
 if %EXIT_CODE% equ 0 (
-    echo [OK] 程序正常退出
+    echo [OK] Program exited normally
 ) else (
-    echo [错误] 程序异常退出 (退出码: %EXIT_CODE%^)
+    echo [ERROR] Program exited with code: %EXIT_CODE%
     echo.
-    echo 按任意键退出...
+    echo Press any key to exit...
     pause > nul
 )
 
