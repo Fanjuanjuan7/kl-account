@@ -23,6 +23,8 @@ class KLZhanghaoApp(ctk.CTk):
         self.runtime_dir = runtime_dir
         self.log = get_logger(__name__)
         self.cfg = load_config(runtime_dir)
+        self.stop_flag = {"stop": False}  # 中断标志
+        self.is_running = False  # 是否正在运行
         
         # 窗口配置
         self.title("KL-zhanghao 账号批量注册工具")
@@ -161,8 +163,14 @@ class KLZhanghaoApp(ctk.CTk):
         button_frame = ctk.CTkFrame(main_frame)
         button_frame.grid(row=5, column=0, padx=10, pady=10, sticky="ew")
         
-        ctk.CTkButton(button_frame, text="开始注册", command=self.start_registration, 
-                     fg_color="green", hover_color="darkgreen", width=150).pack(side="left", padx=5, pady=5)
+        self.start_button = ctk.CTkButton(button_frame, text="开始注册", command=self.start_registration, 
+                     fg_color="green", hover_color="darkgreen", width=150)
+        self.start_button.pack(side="left", padx=5, pady=5)
+        
+        self.stop_button = ctk.CTkButton(button_frame, text="停止注册", command=self.stop_registration, 
+                     fg_color="orange", hover_color="darkorange", width=150, state="disabled")
+        self.stop_button.pack(side="left", padx=5, pady=5)
+        
         ctk.CTkButton(button_frame, text="保存参数", command=self.save_params, width=150).pack(side="left", padx=5, pady=5)
         ctk.CTkButton(button_frame, text="恢复默认", command=self.reset_params, width=150).pack(side="left", padx=5, pady=5)
         ctk.CTkButton(button_frame, text="退出", command=self.quit_app, 
@@ -298,15 +306,38 @@ class KLZhanghaoApp(ctk.CTk):
     
     def start_registration(self):
         """开始注册"""
+        if self.is_running:
+            messagebox.showwarning("警告", "注册任务已在运行中")
+            return
+        
         csv_path = self.csv_entry.get()
         if not csv_path or not Path(csv_path).exists():
             self.update_status("请先选择并加载CSV文件", "red")
             messagebox.showerror("错误", "请先选择并加载CSV文件")
             return
         
+        # 重置中断标志
+        self.stop_flag["stop"] = False
+        self.is_running = True
+        
+        # 更新按钮状态
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        
         # 在新线程中运行注册流程
         thread = threading.Thread(target=self._run_registration, daemon=True)
         thread.start()
+    
+    def stop_registration(self):
+        """停止注册"""
+        if not self.is_running:
+            return
+        
+        if messagebox.askyesno("确认", "确定要停止注册吗？"):
+            self.stop_flag["stop"] = True
+            self.update_log("\n\u26a0️ 用户请求停止注册...\n")
+            self.update_status("正在停止...", "orange")
+            self.stop_button.configure(state="disabled")
     
     def _run_registration(self):
         """执行注册流程（在后台线程）"""
@@ -325,46 +356,78 @@ class KLZhanghaoApp(ctk.CTk):
                 else:
                     self.update_log("⚠️ 警告：未指定XPath配置文件\n")
             
-            # 执行批量注册
             browser_mode = self.browser_mode_var.get()
             
-            # 根据浏览器模式决定是否传递bitbrowser_base_url
-            if browser_mode == "playwright":
-                # Playwright模式：不传bitbrowser_base_url，使用本地浏览器
-                output = register_accounts_batch(
-                    csv_path=csv_path,
-                    runtime_dir=self.runtime_dir,
-                    concurrency=int(self.concurrency_var.get()),
-                    interval_ms=int(self.interval_var.get()),
-                    bitbrowser_base_url=None,  # Playwright模式
-                    platform_url=self.url_entry.get() or None,
-                    group_id=None,
-                    auto_xpaths=xjson,
-                    dry_run=not auto or not bool(xjson),
-                    browser_mode="playwright",  # 明确指定Playwright模式
-                )
-            else:
-                # 比特浏览器模式
-                output = register_accounts_batch(
-                    csv_path=csv_path,
-                    runtime_dir=self.runtime_dir,
-                    concurrency=int(self.concurrency_var.get()),
-                    interval_ms=int(self.interval_var.get()),
-                    bitbrowser_base_url=self.api_entry.get() or None,
-                    platform_url=self.url_entry.get() or None,
-                    bitbrowser_password=self.bitbrowser_password_entry.get() or None,  # 比特浏览器密码
-                    auto_xpaths=xjson,
-                    dry_run=not auto or not bool(xjson),
-                    browser_mode="bitbrowser",
-                )
-            
-            self.update_log(output + "\n")
-            self.update_status("注册流程完成", "green")
+            # 🔄 循环执行直到所有账号都成功注册
+            round_num = 0
+            while not self.stop_flag.get("stop", False):
+                round_num += 1
+                self.update_log(f"\n{'='*50}\n🔄 第 {round_num} 轮注册\n{'='*50}\n")
+                
+                # 根据浏览器模式决定是否传递bitbrowser_base_url
+                if browser_mode == "playwright":
+                    # Playwright模式：不传bitbrowser_base_url，使用本地浏览器
+                    output = register_accounts_batch(
+                        csv_path=csv_path,
+                        runtime_dir=self.runtime_dir,
+                        concurrency=int(self.concurrency_var.get()),
+                        interval_ms=int(self.interval_var.get()),
+                        bitbrowser_base_url=None,  # Playwright模式
+                        platform_url=self.url_entry.get() or None,
+                        group_id=None,
+                        auto_xpaths=xjson,
+                        dry_run=not auto or not bool(xjson),
+                        browser_mode="playwright",  # 明确指定Playwright模式
+                        stop_flag=self.stop_flag,  # 传递中断标志
+                    )
+                else:
+                    # 比特浏览器模式
+                    output = register_accounts_batch(
+                        csv_path=csv_path,
+                        runtime_dir=self.runtime_dir,
+                        concurrency=int(self.concurrency_var.get()),
+                        interval_ms=int(self.interval_var.get()),
+                        bitbrowser_base_url=self.api_entry.get() or None,
+                        platform_url=self.url_entry.get() or None,
+                        bitbrowser_password=self.bitbrowser_password_entry.get() or None,  # 比特浏览器密码
+                        auto_xpaths=xjson,
+                        dry_run=not auto or not bool(xjson),
+                        browser_mode="bitbrowser",
+                        stop_flag=self.stop_flag,  # 传递中断标志
+                    )
+                
+                self.update_log(output + "\n")
+                
+                # 检查是否被中断
+                if self.stop_flag.get("stop", False):
+                    self.update_log("\n⚠️ 用户停止注册任务\n")
+                    self.update_status("注册已停止", "orange")
+                    break
+                
+                # 检查是否还有未成功的账号
+                from ..services.account import load_accounts_csv
+                remaining = load_accounts_csv(csv_path, skip_success=True)
+                
+                if not remaining:
+                    self.update_log(f"\n{'='*50}\n🎉 所有账号注册完成！\n{'='*50}\n")
+                    self.update_status("所有账号注册完成", "green")
+                    break
+                else:
+                    self.update_log(f"\n⚠️ 还有 {len(remaining)} 个账号未成功，继续注册...\n")
+                    self.update_status(f"还有 {len(remaining)} 个账号未成功", "orange")
+                    # 等待5秒后继续下一轮
+                    import time
+                    time.sleep(5)
             
         except Exception as e:
             self.log.exception("Registration error")
             self.update_log(f"\n错误: {e}\n")
             self.update_status(f"注册失败: {e}", "red")
+        finally:
+            # 恢复按钮状态
+            self.is_running = False
+            self.start_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
     
     def save_params(self):
         """保存参数"""

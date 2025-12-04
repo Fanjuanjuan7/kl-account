@@ -501,14 +501,24 @@ def run_registration_flow(
                         log.warning("No suitable page found, will create new browser")
                         browser = None
                         
+                        # 如果是比特浏览器模式，不能创建新浏览器
+                        if browser_mode != "playwright":
+                            log.error("❌ 比特浏览器模式下无法创建新浏览器实例")
+                            return False
+                        
                 except Exception as e:
                     log.error(f"Failed to attach to BitBrowser: {e}")
                     import traceback
                     log.error(traceback.format_exc())
                     browser = None
+                    
+                    # 如果是比特浏览器模式，不能创建新浏览器
+                    if browser_mode != "playwright":
+                        log.error("❌ 比特浏览器模式下无法连接到现有浏览器实例")
+                        return False
             
-            # 如果没有附着成功，创建新浏览器
-            if not browser:
+            # 如果没有附着成功，且是Playwright模式，创建新浏览器
+            if not browser and browser_mode == "playwright":
                 log.info("Launching new browser instance")
                 
                 # 准备上下文配置

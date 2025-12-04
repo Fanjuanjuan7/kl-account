@@ -1,11 +1,15 @@
 from pathlib import Path
 import csv
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Dict, Any
 from ..utils.logger import get_logger
 from ..integrations.bitbrowser import BitBrowserClient
 from .automation import run_registration_flow
+
+# 添加全局锁，用于保护CSV文件写入
+_csv_locks: Dict[str, threading.Lock] = {}
 
 
 def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
@@ -22,58 +26,72 @@ def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
     """
     log = get_logger(__name__)
     
-    try:
-        # 读取所有行
-        rows = []
-        with csv_path.open("r", encoding="utf-8-sig", newline='') as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-        
-        if not rows:
-            log.error("CSV文件为空")
+    # 获取或创建该CSV文件的锁
+    csv_key = str(csv_path.absolute())
+    if csv_key not in _csv_locks:
+        _csv_locks[csv_key] = threading.Lock()
+    
+    # 使用锁保护CSV文件读写，防止并发冲突
+    with _csv_locks[csv_key]:
+        try:
+            # 读取所有行
+            rows = []
+            with csv_path.open("r", encoding="utf-8-sig", newline='') as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+            
+            if not rows:
+                log.error("❌ CSV文件为空")
+                return False
+            
+            # 确定是否有标题行
+            has_header = rows[0] and "email" in rows[0][0].lower()
+            start_row = 1 if has_header else 0
+            
+            # 查找并更新对应行
+            updated = False
+            for i in range(start_row, len(rows)):
+                row = rows[i]
+                if len(row) >= 1 and row[0].strip() == email:
+                    # 扩展行到至少9列
+                    while len(row) < 9:
+                        row.append("")
+                    # 更新第9列（索引8）
+                    row[8] = status
+                    rows[i] = row
+                    updated = True
+                    log.info(f"✅ 已更新 {email} 的状态为: {status}")
+                    break
+            
+            if not updated:
+                log.warning(f"⚠️ 未找到邮箱 {email} 对应的行")
+                return False
+            
+            # 写回文件
+            with csv_path.open("w", encoding="utf-8-sig", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+            
+            log.info(f"✅ CSV文件已更新: {csv_path}")
+            return True
+            
+        except Exception as e:
+            log.error(f"❌ 更新CSV状态失败: {e}")
+            import traceback
+            log.error(traceback.format_exc())
             return False
-        
-        # 确定是否有标题行
-        has_header = rows[0] and "email" in rows[0][0].lower()
-        start_row = 1 if has_header else 0
-        
-        # 查找并更新对应行
-        updated = False
-        for i in range(start_row, len(rows)):
-            row = rows[i]
-            if len(row) >= 1 and row[0].strip() == email:
-                # 扩展行到至少9列
-                while len(row) < 9:
-                    row.append("")
-                # 更新第9列（索引8）
-                row[8] = status
-                rows[i] = row
-                updated = True
-                log.info(f"✅ 已更新 {email} 的状态为: {status}")
-                break
-        
-        if not updated:
-            log.warning(f"⚠️ 未找到邮箱 {email} 对应的行")
-            return False
-        
-        # 写回文件
-        with csv_path.open("w", encoding="utf-8-sig", newline='') as f:
-            writer = csv.writer(f)
-            writer.writerows(rows)
-        
-        log.info(f"✅ CSV文件已更新: {csv_path}")
-        return True
-        
-    except Exception as e:
-        log.error(f"❌ 更新CSV状态失败: {e}")
-        import traceback
-        log.error(traceback.format_exc())
-        return False
 
 
-def load_accounts_csv(csv_path: Path) -> List[Dict[str, Any]]:
-    # 加载账号与代理（可选）列表
-    # CSV格式：邮箱账号、邮箱密码、邮箱验证码接码地址、代理ip、代理端口、代理用户名、代理密码
+def load_accounts_csv(csv_path: Path, skip_success: bool = True) -> List[Dict[str, Any]]:
+    """
+    加载账号与代理（可选）列表
+    CSV格式：邮箱账号、邮箱密码、邮箱验证码接码地址、代理ip、代理端口、代理用户名、代理密码、保留列、分组名、状态
+    
+    参数：
+        csv_path: CSV文件路径
+        skip_success: 是否跳过状态为"成功"的账号，默认True
+    """
+    log = get_logger(__name__)
     rows: List[Dict[str, Any]] = []
     with csv_path.open("r", encoding="utf-8-sig") as f:  # utf-8-sig自动处理BOM
         reader = csv.reader(f)
@@ -82,6 +100,13 @@ def load_accounts_csv(csv_path: Path) -> List[Dict[str, Any]]:
             if i == 0 and row and "email" in row[0].lower():
                 continue
             if len(row) >= 2:
+                # 检查第9列状态（索引8）
+                status = row[8].strip() if len(row) >= 9 else ""
+                
+                # 如果skip_success=True，跳过状态为"成功"的行
+                if skip_success and status == "成功":
+                    continue
+                
                 rec: Dict[str, Any] = {
                     "email": row[0].strip(),
                     "password": row[1].strip(),
@@ -98,9 +123,34 @@ def load_accounts_csv(csv_path: Path) -> List[Dict[str, Any]]:
                         rec["port"] = int(port_str)
                     else:
                         rec["port"] = None
-                if len(row) >= 7:
-                    rec["proxyUserName"] = row[5].strip() if row[5].strip() else None
-                    rec["proxyPassword"] = row[6].strip() if row[6].strip() else None
+                # 代理用户名和密码
+                if len(row) >= 6 and row[5].strip():
+                    rec["proxyUserName"] = row[5].strip()
+                else:
+                    rec["proxyUserName"] = None
+                if len(row) >= 7 and row[6].strip():
+                    rec["proxyPassword"] = row[6].strip()
+                else:
+                    rec["proxyPassword"] = None
+                # 第8列（索引7）：分组名称（用于比特浏览器分组）
+                if len(row) >= 8:
+                    # 清理所有类型的空白字符（包括全角空格、制表符等）
+                    group_name_raw = row[7]
+                    if group_name_raw:
+                        # 移除所有空白字符（包括\u3000全角空格）
+                        group_name_cleaned = ''.join(group_name_raw.split())
+                        if group_name_cleaned:
+                            rec["groupName"] = group_name_cleaned
+                            log.debug(f"📁 读取分组: '{group_name_cleaned}' (原始: '{group_name_raw}')")
+                        else:
+                            rec["groupName"] = None
+                    else:
+                        rec["groupName"] = None
+                else:
+                    rec["groupName"] = None
+                # 第9列（索引8）：状态
+                rec["status"] = status
+                
                 rows.append(rec)
     return rows
 
@@ -256,6 +306,7 @@ def register_accounts_batch(
     auto_xpaths: Optional[Dict[str, str]] = None,
     dry_run: bool = False,  # 默认改为False，启用真实自动化
     browser_mode: str = "bitbrowser",  # 浏览器模式: bitbrowser 或 playwright
+    stop_flag: Optional[Dict[str, bool]] = None,  # 中断标志
 ) -> str:
     log = get_logger(__name__)
     rows = load_accounts_csv(csv_path)
@@ -269,6 +320,11 @@ def register_accounts_batch(
         log.info(f"Starting batch registration for {len(rows)} accounts")
         
         for idx, rec in enumerate(rows, 1):
+            # 检查中断标志
+            if stop_flag and stop_flag.get("stop", False):
+                log.info("⚠️ 检测到中断信号，停止注册")
+                break
+            
             email = rec.get("email")
             password = rec.get("password")
             code_url = rec.get("code_url")
@@ -368,18 +424,93 @@ def register_accounts_batch(
     log.info(f"开始批量注册 {len(rows)} 个账号，并发数: {concurrency}")
     
     # 🔴 使用线程池实现并发执行
+    def force_cleanup_window(client: BitBrowserClient, window_id: str, password: Optional[str], logger) -> bool:
+        """
+        强制清理窗口：确保窗口被关闭和删除，即使遇到网络错误也要多次尝试
+        
+        Args:
+            client: BitBrowserClient实例
+            window_id: 窗口ID
+            password: 比特浏览器密码
+            logger: 日志记录器
+        
+        Returns:
+            bool: 是否成功清理
+        """
+        import time
+        
+        try:
+            # 最多尝试5次清理
+            for attempt in range(5):
+                try:
+                    logger.info(f"🔄 清理窗口尝试 {attempt + 1}/5: {window_id}")
+                    
+                    # 1. 尝试关闭窗口
+                    try:
+                        close_result = client.close_window(window_id)
+                        if close_result.get("success"):
+                            logger.info(f"✅ 窗口已关闭: {window_id}")
+                        else:
+                            logger.warning(f"⚠️ 关闭窗口失败: {close_result.get('msg', '未知错误')}")
+                    except Exception as close_err:
+                        logger.warning(f"⚠️ 关闭窗口异常: {close_err}")
+                    
+                    # 2. 等待确保窗口关闭
+                    time.sleep(2)
+                    
+                    # 3. 尝试删除窗口
+                    try:
+                        delete_result = client.delete_window(window_id, password)
+                        if delete_result.get("success"):
+                            logger.info(f"✅ 窗口已删除: {window_id}")
+                            return True  # 成功删除
+                        else:
+                            logger.warning(f"⚠️ 删除窗口失败: {delete_result.get('msg', '未知错误')}")
+                    except Exception as del_err:
+                        logger.warning(f"⚠️ 删除窗口异常: {del_err}")
+                    
+                    # 4. 如果不是最后一次尝试，等待后重试
+                    if attempt < 4:
+                        wait_time = 2 ** attempt  # 1s, 2s, 4s, 8s
+                        logger.info(f"⏳ 等待 {wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                        
+                except Exception as attempt_err:
+                    logger.warning(f"⚠️ 清理尝试 {attempt + 1} 异常: {attempt_err}")
+                    if attempt < 4:
+                        time.sleep(2 ** attempt)
+            
+            logger.error(f"❌ 窗口清理最终失败: {window_id}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ 窗口清理过程发生严重异常: {e}")
+            return False
+    
+    
     def process_account(idx: int, rec: Dict[str, Any]) -> Tuple[bool, str, str, Optional[str]]:
         """
         处理单个账号注册
         返回: (success, email, message, window_id)
         """
+        # 检查中断标志（在开始前检查）
+        if stop_flag and stop_flag.get("stop", False):
+            email = rec.get("email", "")
+            log.info(f"⏹️ 检测到中断信号，跳过账号处理: {email}")
+            return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
+        
         email = rec.get("email")
         password = rec.get("password")
         code_url = rec.get("code_url")
+        group_name = rec.get("groupName")  # 获取分组名称
         window_id = None
         
         log.info(f"\n{'='*60}")
         log.info(f"处理账号 {idx}/{len(rows)}: {email}")
+        if group_name:
+            log.info(f"📁 分组名称: {group_name}")
+        else:
+            log.info("📁 分组名称: 未设置（将使用默认分组）")
         log.info(f"{'='*60}")
         
         try:
@@ -390,6 +521,22 @@ def register_accounts_batch(
                 "proxyMethod": 2,
                 "browserFingerPrint": {},
             }
+            
+            # 添加分组ID（如果有分组名称）
+            if group_name:
+                log.info(f"📁 处理分组名称: '{group_name}'")
+                # 通过分组名称获取或创建分组ID
+                group_id = client.get_or_create_group(group_name)
+                if group_id:
+                    payload["groupId"] = group_id
+                    log.info(f"✅ 已将窗口分配到分组: {group_name} (ID: {group_id})")
+                else:
+                    log.warning(f"⚠️ 获取分组ID失败，将使用默认分组: {group_name}")
+                    log.warning(f"📋 窗口创建参数: {payload}")
+                    # 即使分组ID获取失败也继续创建窗口，避免完全中断流程
+            else:
+                log.info("⚠️ CSV第8列为空，窗口将使用默认分组")
+            
             # 设置代理
             host = rec.get("host")
             port = rec.get("port")
@@ -406,20 +553,51 @@ def register_accounts_batch(
                 if ppass:
                     payload["proxyPassword"] = ppass
             
+            # 检查中断标志（在创建窗口前检查）
+            if stop_flag and stop_flag.get("stop", False):
+                log.info(f"⏹️ 检测到中断信号，取消窗口创建: {email}")
+                return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
+            
             # 创建窗口
             r = client.create_window(payload)
             if not r.get("success"):
-                return (False, email, f"FAIL: {r.get('msg')}", None)
+                # 即使API返回失败，也要尝试获取窗口ID并清理
+                data = r.get("data", {})
+                temp_window_id = data.get("id") or ""
+                if temp_window_id:
+                    log.warning(f"⚠️ 窗口创建API返回失败但返回了窗口ID，尝试清理: {temp_window_id}")
+                    # 增强清理逻辑：即使网络错误也要多次尝试
+                    force_cleanup_window(client, temp_window_id, bitbrowser_password, log)
+                return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
             
             data = r.get("data", {})
             window_id = data.get("id") or ""
             if not window_id:
+                log.error("❌ 窗口创建成功但未返回窗口ID")
                 return (False, email, "FAIL: No window ID", None)
+            
+            # 检查中断标志（在打开窗口前检查）
+            if stop_flag and stop_flag.get("stop", False):
+                log.info(f"⏹️ 检测到中断信号，关闭并删除已创建的窗口: {email} (ID: {window_id})")
+                # 立即清理已创建的窗口
+                force_cleanup_window(client, window_id, bitbrowser_password, log)
+                return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
             
             # 打开窗口
             open_result = client.open_window(window_id)
             log.info(f"Window opened for {email}: {open_result}")
             time.sleep(5)
+            
+            # 激活窗口确保显示在前台
+            try:
+                activate_result = client.activate(window_id)
+                log.info(f"✅ 窗口已激活: {activate_result}")
+            except Exception as activate_err:
+                log.warning(f"⚠️ 窗口激活失败: {activate_err}")
+                # 即使激活失败也继续执行，避免中断整个流程
+            
+            # 等待窗口稳定
+            time.sleep(2)
             
             # 获取WebSocket
             ws = None
@@ -437,6 +615,21 @@ def register_accounts_batch(
                             port = port_match.group(1)
                             ws = f"ws://127.0.0.1:{port}/devtools/browser"
                             log.info(f"✅ Constructed WebSocket: {ws}")
+            
+            # 再次激活窗口确保显示在前台
+            try:
+                client.activate(window_id)
+                log.info("✅ 窗口已再次激活")
+            except Exception as activate_err:
+                log.warning(f"⚠️ 窗口再次激活失败: {activate_err}")
+                # 即使激活失败也继续执行，避免中断整个流程
+            
+            # 检查中断标志（在执行自动化前检查）
+            if stop_flag and stop_flag.get("stop", False):
+                log.info(f"⏹️ 检测到中断信号，关闭并删除已打开的窗口: {email} (ID: {window_id})")
+                # 立即清理已打开的窗口
+                force_cleanup_window(client, window_id, bitbrowser_password, log)
+                return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
             
             # 执行自动化注册
             auto_ok = run_registration_flow(
@@ -473,62 +666,44 @@ def register_accounts_batch(
             else:
                 # 注册失败，关闭并删除窗口
                 if window_id:
-                    try:
-                        log.info(f"🗑️ 注册失败，关闭并删除窗口: {window_id}")
-                        
-                        # 先关闭窗口
-                        try:
-                            close_result = client.close_window(window_id)
-                            if close_result.get("success"):
-                                log.info(f"✅ 窗口已关闭: {window_id}")
-                            else:
-                                log.warning(f"⚠️ 关闭窗口失败: {close_result.get('msg')}")
-                        except Exception as close_err:
-                            log.warning(f"⚠️ 关闭窗口异常: {close_err}")
-                        
-                        # 再删除窗口
-                        delete_result = client.delete_window(window_id, bitbrowser_password)
-                        if delete_result.get("success"):
-                            log.info(f"✅ 窗口已删除: {window_id}")
-                        else:
-                            log.warning(f"⚠️ 删除窗口失败: {delete_result.get('msg')}")
-                    except Exception as del_err:
-                        log.error(f"❌ 删除窗口异常: {del_err}")
+                    log.info(f"🗑️ 注册失败，关闭并删除窗口: {window_id}")
+                    # 增强清理逻辑：确保窗口被彻底清理
+                    force_cleanup_window(client, window_id, bitbrowser_password, log)
                 return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", None)
                 
         except Exception as e:
             # 异常时也尝试关闭并删除窗口
+            log.error(f"❌ 注册过程发生异常: {e}")
             if window_id:
-                try:
-                    log.info(f"❌ 异常发生，关闭并删除窗口: {window_id}")
-                    
-                    # 先关闭窗口
-                    try:
-                        client.close_window(window_id)
-                        log.info(f"✅ 窗口已关闭: {window_id}")
-                    except Exception:
-                        pass
-                    
-                    # 再删除窗口
-                    try:
-                        client.delete_window(window_id, bitbrowser_password)
-                        log.info(f"✅ 窗口已删除: {window_id}")
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                log.info(f"🧹 异常发生，清理窗口: {window_id}")
+                # 增强清理逻辑：确保窗口被彻底清理
+                force_cleanup_window(client, window_id, bitbrowser_password, log)
             return (False, email, f"ERROR {email}: {e}", None)
     
     # 使用线程池并发执行
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
         futures = {}
         for idx, rec in enumerate(rows, 1):
+            # 检查中断标志
+            if stop_flag and stop_flag.get("stop", False):
+                log.info("⚠️ 检测到中断信号，停止提交新任务")
+                break
+            
             future = executor.submit(process_account, idx, rec)
             futures[future] = rec.get("email")
             time.sleep(interval_ms / 1000.0)  # 间隔提交
         
         # 等待所有任务完成
         for future in as_completed(futures):
+            # 检查中断标志
+            if stop_flag and stop_flag.get("stop", False):
+                log.info("⚠️ 检测到中断信号，取消剩余任务")
+                # 取消所有未完成的任务
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
+                break
+            
             email = futures[future]
             try:
                 success, result_email, message, window_id = future.result()
