@@ -10,6 +10,8 @@ from .automation import run_registration_flow
 
 # 添加全局锁，用于保护CSV文件写入
 _csv_locks: Dict[str, threading.Lock] = {}
+# 记录每个邮箱对应的窗口ID，用于失败重试时复用窗口
+_window_registry: Dict[str, str] = {}
 
 
 def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
@@ -296,89 +298,90 @@ def register_accounts_batch(
     interval_ms: int = 300,
     bitbrowser_base_url: Optional[str] = None,
     platform_url: Optional[str] = None,
-    bitbrowser_password: Optional[str] = None,  # 比特浏览器密码
+    bitbrowser_password: Optional[str] = None,
     auto_xpaths: Optional[Dict[str, str]] = None,
-    dry_run: bool = False,  # 默认改为False，启用真实自动化
-    browser_mode: str = "bitbrowser",  # 浏览器模式: bitbrowser 或 playwright
-    stop_flag: Optional[Dict[str, bool]] = None,  # 中断标志
+    dry_run: bool = False,
+    browser_mode: str = "bitbrowser",
+    stop_flag: Optional[Dict[str, bool]] = None,
 ) -> str:
     log = get_logger(__name__)
     rows = load_accounts_csv(csv_path)
 
-    # Playwright模式：直接执行自动化，不需要比特浏览器客户端
+    # Playwright模式：直接执行自动化，加入多轮重试
     if browser_mode == "playwright":
         log.info(f"🎭 Playwright模式 - 将使用本地浏览器 + 随机指纹")
         ok, fail = 0, 0
         outputs: List[str] = []
-        
-        log.info(f"Starting batch registration for {len(rows)} accounts")
-        
-        for idx, rec in enumerate(rows, 1):
-            # 检查中断标志
+        max_rounds = 5
+        for round_idx in range(1, max_rounds + 1):
             if stop_flag and stop_flag.get("stop", False):
-                log.info("⚠️ 检测到中断信号，停止注册")
+                log.info("⏹️ 用户中断，停止所有轮次")
                 break
-            
-            email = rec.get("email")
-            password = rec.get("password")
-            code_url = rec.get("code_url")
-            host = rec.get("host")
-            port = rec.get("port")
-            puser = rec.get("proxyUserName")
-            ppass = rec.get("proxyPassword")
-            
-            log.info(f"\n{'='*60}")
-            log.info(f"Processing account {idx}/{len(rows)}: {email}")
-            log.info(f"{'='*60}")
-            
-            try:
-                # 直接调用自动化流程，不需要比特浏览器
-                auto_ok = run_registration_flow(
-                    email=email,
-                    password=password,
-                    runtime_dir=runtime_dir,
-                    xpaths=auto_xpaths or {},
-                    proxy={
-                        "host": host,
-                        "port": port,
-                        "username": puser,
-                        "password": ppass,
-                    },
-                    platform_url=platform_url or "https://klingai.com",
-                    code_url=code_url,
-                    attach_ws=None,  # Playwright模式不需要WebSocket
-                    dry_run=dry_run,
-                    browser_mode="playwright",
-                )
-                
-                if auto_ok:
-                    ok += 1
-                    success_msg = f"SUCCESS {idx}/{len(rows)}: {email}"
-                    outputs.append(success_msg)
-                    log.info(f"✅ {success_msg}")
-                    
-                    # 更新CSV状态为"成功"
-                    update_csv_status(csv_path, email, "成功")
-                else:
+            rows = load_accounts_csv(csv_path, skip_success=True)
+            if not rows:
+                log.info("🎉 所有账号均已成功，无需继续重试")
+                break
+            log.info(f"🔁 开始第 {round_idx}/{max_rounds} 轮注册，待处理 {len(rows)} 个账号")
+            for idx, rec in enumerate(rows, 1):
+                if stop_flag and stop_flag.get("stop", False):
+                    log.info("⚠️ 检测到中断信号，停止注册")
+                    break
+                email = rec.get("email")
+                password = rec.get("password")
+                code_url = rec.get("code_url")
+                host = rec.get("host")
+                port = rec.get("port")
+                puser = rec.get("proxyUserName")
+                ppass = rec.get("proxyPassword")
+                log.info(f"\n{'='*60}")
+                log.info(f"Processing account {idx}/{len(rows)}: {email}")
+                log.info(f"{'='*60}")
+                try:
+                    auto_ok = run_registration_flow(
+                        email=email,
+                        password=password,
+                        runtime_dir=runtime_dir,
+                        xpaths=auto_xpaths or {},
+                        proxy={
+                            "host": host,
+                            "port": port,
+                            "username": puser,
+                            "password": ppass,
+                        },
+                        platform_url=platform_url or "https://klingai.com",
+                        code_url=code_url,
+                        attach_ws=None,
+                        dry_run=dry_run,
+                        browser_mode="playwright",
+                    )
+                    if auto_ok:
+                        ok += 1
+                        success_msg = f"SUCCESS {idx}/{len(rows)}: {email}"
+                        outputs.append(success_msg)
+                        log.info(f"✅ {success_msg}")
+                        update_csv_status(csv_path, email, "成功")
+                    else:
+                        fail += 1
+                        fail_msg = f"FAIL {idx}/{len(rows)}: {email} - automation failed"
+                        outputs.append(fail_msg)
+                        log.error(f"❌ {fail_msg}")
+                        update_csv_status(csv_path, email, "失败")
+                except Exception as e:
                     fail += 1
-                    fail_msg = f"FAIL {idx}/{len(rows)}: {email} - automation failed"
-                    outputs.append(fail_msg)
-                    log.error(f"❌ {fail_msg}")
-                    
-                    # 更新CSV状态为"失败"
+                    outputs.append(f"ERROR {idx}/{len(rows)}: {email}: {e}")
+                    log.error(f"ERROR processing {email}: {e}")
                     update_csv_status(csv_path, email, "失败")
-            except Exception as e:
-                fail += 1
-                outputs.append(f"ERROR {idx}/{len(rows)}: {email}: {e}")
-                log.error(f"ERROR processing {email}: {e}")
-                
-                # 更新CSV状态为"失败"
-                update_csv_status(csv_path, email, "失败")
-            
-            time.sleep(interval_ms / 1000.0)
-        
-        # 最终统计
-        summary = f"\n{'='*60}\nBatch Registration Complete\n{'='*60}\nTotal: {len(rows)} | Success: {ok} | Failed: {fail}\n{'='*60}"
+                time.sleep(interval_ms / 1000.0)
+        final_rows = load_accounts_csv(csv_path, skip_success=False)
+        total_accounts = len(final_rows)
+        final_success = sum(1 for r in final_rows if (r.get('status') == '成功'))
+        final_failed = total_accounts - final_success
+        summary = (
+            f"\n{'='*60}\nBatch Registration Complete\n{'='*60}\n"
+            f"Final Success: {final_success} | Final Failed: {final_failed} | Total: {total_accounts}\n"
+            f"Attempts -> Success: {ok} | Failed: {fail}\n"
+            f"{'='*60}"
+        )
         log.info(summary)
         return "\n".join(outputs + [summary])
 
@@ -543,23 +546,24 @@ def register_accounts_batch(
                 log.info(f"⏹️ 检测到中断信号，取消窗口创建: {email}")
                 return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
             
-            # 创建窗口
-            r = client.create_window(payload)
-            if not r.get("success"):
-                # 即使API返回失败，也要尝试获取窗口ID并清理
+            # 复用已存在窗口，否则创建新窗口
+            if email in _window_registry and _window_registry[email]:
+                window_id = _window_registry[email]
+                log.info(f"♻️ 复用已有窗口: {window_id}")
+            else:
+                r = client.create_window(payload)
+                if not r.get("success"):
+                    data = r.get("data", {})
+                    temp_window_id = data.get("id") or ""
+                    if temp_window_id:
+                        log.warning(f"⚠️ 窗口创建API返回失败但返回了窗口ID，暂不删除: {temp_window_id}")
+                    return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
                 data = r.get("data", {})
-                temp_window_id = data.get("id") or ""
-                if temp_window_id:
-                    log.warning(f"⚠️ 窗口创建API返回失败但返回了窗口ID，尝试清理: {temp_window_id}")
-                    # 增强清理逻辑：即使网络错误也要多次尝试
-                    force_cleanup_window(client, temp_window_id, bitbrowser_password, log)
-                return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
-            
-            data = r.get("data", {})
-            window_id = data.get("id") or ""
-            if not window_id:
-                log.error("❌ 窗口创建成功但未返回窗口ID")
-                return (False, email, "FAIL: No window ID", None)
+                window_id = data.get("id") or ""
+                if not window_id:
+                    log.error("❌ 窗口创建成功但未返回窗口ID")
+                    return (False, email, "FAIL: No window ID", None)
+                _window_registry[email] = window_id
             
             # 检查中断标志（在打开窗口前检查）
             if stop_flag and stop_flag.get("stop", False):
@@ -649,15 +653,17 @@ def register_accounts_batch(
                         log.error(f"❌ 关闭窗口异常: {close_err}")
                 return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
             else:
-                # 注册失败，关闭并删除窗口
+                # 注册失败，仅关闭窗口，不删除；保留用于重试
                 if window_id:
-                    log.info(f"🗑️ 注册失败，关闭并删除窗口: {window_id}")
-                    # 增强清理逻辑：确保窗口被彻底清理
-                    force_cleanup_window(client, window_id, bitbrowser_password, log)
-                return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", None)
+                    try:
+                        log.info(f"⚠️ 注册失败，关闭窗口以供重试: {window_id}")
+                        client.close_window(window_id)
+                    except Exception as close_err:
+                        log.warning(f"⚠️ 关闭失败窗口异常: {close_err}")
+                return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", window_id)
                 
         except Exception as e:
-            # 异常时也尝试关闭并删除窗口
+            # 异常时可删除未成功的窗口
             log.error(f"❌ 注册过程发生异常: {e}")
             if window_id:
                 log.info(f"🧹 异常发生，清理窗口: {window_id}")
@@ -666,51 +672,62 @@ def register_accounts_batch(
             return (False, email, f"ERROR {email}: {e}", None)
     
     # 使用线程池并发执行
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
-        futures = {}
-        for idx, rec in enumerate(rows, 1):
-            # 检查中断标志
-            if stop_flag and stop_flag.get("stop", False):
-                log.info("⚠️ 检测到中断信号，停止提交新任务")
-                break
-            
-            future = executor.submit(process_account, idx, rec)
-            futures[future] = rec.get("email")
-            time.sleep(interval_ms / 1000.0)  # 间隔提交
-        
-        # 等待所有任务完成
-        for future in as_completed(futures):
-            # 检查中断标志
-            if stop_flag and stop_flag.get("stop", False):
-                log.info("⚠️ 检测到中断信号，取消剩余任务")
-                # 取消所有未完成的任务
-                for f in futures:
-                    if not f.done():
-                        f.cancel()
-                break
-            
-            email = futures[future]
-            try:
-                success, result_email, message, window_id = future.result()
-                outputs.append(message)
-                
-                if success:
-                    ok += 1
-                    log.info(f"✅ {message}")
-                    update_csv_status(csv_path, result_email, "成功")
-                else:
+    # 多轮重试：最多5轮，直到全部成功或中断
+    max_rounds = 5
+    for round_idx in range(1, max_rounds + 1):
+        if stop_flag and stop_flag.get("stop", False):
+            log.info("⏹️ 用户中断，停止所有轮次")
+            break
+        rows = load_accounts_csv(csv_path, skip_success=True)
+        if not rows:
+            log.info("🎉 所有账号均已成功，无需继续重试")
+            break
+        log.info(f"🔁 开始第 {round_idx}/{max_rounds} 轮注册，待处理 {len(rows)} 个账号")
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+            futures = {}
+            for idx, rec in enumerate(rows, 1):
+                if stop_flag and stop_flag.get("stop", False):
+                    log.info("⚠️ 检测到中断信号，停止提交新任务")
+                    break
+                future = executor.submit(process_account, idx, rec)
+                futures[future] = rec.get("email")
+                time.sleep(interval_ms / 1000.0)
+            for future in as_completed(futures):
+                if stop_flag and stop_flag.get("stop", False):
+                    log.info("⚠️ 检测到中断信号，取消剩余任务")
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    break
+                email = futures[future]
+                try:
+                    success, result_email, message, window_id = future.result()
+                    outputs.append(message)
+                    if success:
+                        ok += 1
+                        log.info(f"✅ {message}")
+                        update_csv_status(csv_path, result_email, "成功")
+                    else:
+                        fail += 1
+                        log.error(f"❌ {message}")
+                        update_csv_status(csv_path, result_email, "失败")
+                except Exception as e:
                     fail += 1
-                    log.error(f"❌ {message}")
-                    update_csv_status(csv_path, result_email, "失败")
-            except Exception as e:
-                fail += 1
-                error_msg = f"ERROR {email}: {e}"
-                outputs.append(error_msg)
-                log.error(error_msg)
-                update_csv_status(csv_path, email, "失败")
+                    error_msg = f"ERROR {email}: {e}"
+                    outputs.append(error_msg)
+                    log.error(error_msg)
+                    update_csv_status(csv_path, email, "失败")
     
     # 最终统计
-    summary = f"\n{'='*60}\nBatch Registration Complete\n{'='*60}\nTotal: {len(rows)} | Success: {ok} | Failed: {fail}\n{'='*60}"
+    final_rows = load_accounts_csv(csv_path, skip_success=False)
+    total_accounts = len(final_rows)
+    final_success = sum(1 for r in final_rows if (r.get('status') == '成功'))
+    final_failed = total_accounts - final_success
+    summary = (
+        f"\n{'='*60}\nBatch Registration Complete\n{'='*60}\n"
+        f"Final Success: {final_success} | Final Failed: {final_failed} | Total: {total_accounts}\n"
+        f"Attempts -> Success: {ok} | Failed: {fail}\n"
+        f"{'='*60}"
+    )
     log.info(summary)
     return "\n".join(outputs + [summary])
-
