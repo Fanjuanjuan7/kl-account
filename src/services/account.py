@@ -85,7 +85,7 @@ def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
 def load_accounts_csv(csv_path: Path, skip_success: bool = True) -> List[Dict[str, Any]]:
     """
     加载账号与代理（可选）列表
-    CSV格式：邮箱账号、邮箱密码、邮箱验证码接码地址、代理ip、代理端口、代理用户名、代理密码、保留列、分组名、状态
+    CSV格式：邮箱账号、邮箱密码、邮箱验证码接码地址、代理ip、代理端口、代理用户名、代理密码、窗口名称、状态
     
     参数：
         csv_path: CSV文件路径
@@ -132,22 +132,16 @@ def load_accounts_csv(csv_path: Path, skip_success: bool = True) -> List[Dict[st
                     rec["proxyPassword"] = row[6].strip()
                 else:
                     rec["proxyPassword"] = None
-                # 第8列（索引7）：分组名称（用于比特浏览器分组）
+                # 第8列（索引7）：窗口名称
                 if len(row) >= 8:
-                    # 清理所有类型的空白字符（包括全角空格、制表符等）
-                    group_name_raw = row[7]
-                    if group_name_raw:
-                        # 移除所有空白字符（包括\u3000全角空格）
-                        group_name_cleaned = ''.join(group_name_raw.split())
-                        if group_name_cleaned:
-                            rec["groupName"] = group_name_cleaned
-                            log.debug(f"📁 读取分组: '{group_name_cleaned}' (原始: '{group_name_raw}')")
-                        else:
-                            rec["groupName"] = None
+                    window_name_raw = row[7]
+                    if window_name_raw:
+                        window_name_cleaned = ''.join(window_name_raw.split())
+                        rec["windowName"] = window_name_cleaned if window_name_cleaned else None
                     else:
-                        rec["groupName"] = None
+                        rec["windowName"] = None
                 else:
-                    rec["groupName"] = None
+                    rec["windowName"] = None
                 # 第9列（索引8）：状态
                 rec["status"] = status
                 
@@ -502,15 +496,15 @@ def register_accounts_batch(
         email = rec.get("email")
         password = rec.get("password")
         code_url = rec.get("code_url")
-        group_name = rec.get("groupName")  # 获取分组名称
+        window_name = rec.get("windowName")
         window_id = None
         
         log.info(f"\n{'='*60}")
         log.info(f"处理账号 {idx}/{len(rows)}: {email}")
-        if group_name:
-            log.info(f"📁 分组名称: {group_name}")
+        if window_name:
+            log.info(f"📁 窗口名称: {window_name}")
         else:
-            log.info("📁 分组名称: 未设置（将使用默认分组）")
+            log.info("📁 窗口名称: 未设置")
         log.info(f"{'='*60}")
         
         try:
@@ -522,20 +516,11 @@ def register_accounts_batch(
                 "browserFingerPrint": {},
             }
             
-            # 添加分组ID（如果有分组名称）
-            if group_name:
-                log.info(f"📁 处理分组名称: '{group_name}'")
-                # 通过分组名称获取或创建分组ID
-                group_id = client.get_or_create_group(group_name)
-                if group_id:
-                    payload["groupId"] = group_id
-                    log.info(f"✅ 已将窗口分配到分组: {group_name} (ID: {group_id})")
-                else:
-                    log.warning(f"⚠️ 获取分组ID失败，将使用默认分组: {group_name}")
-                    log.warning(f"📋 窗口创建参数: {payload}")
-                    # 即使分组ID获取失败也继续创建窗口，避免完全中断流程
-            else:
-                log.info("⚠️ CSV第8列为空，窗口将使用默认分组")
+            if window_name:
+                payload["remark"] = window_name
+                payload["name"] = window_name
+                payload["windowName"] = window_name
+                payload["browserAlias"] = window_name
             
             # 设置代理
             host = rec.get("host")
@@ -728,5 +713,4 @@ def register_accounts_batch(
     summary = f"\n{'='*60}\nBatch Registration Complete\n{'='*60}\nTotal: {len(rows)} | Success: {ok} | Failed: {fail}\n{'='*60}"
     log.info(summary)
     return "\n".join(outputs + [summary])
-
 

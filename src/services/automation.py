@@ -204,7 +204,7 @@ def _calculate_relative_distance_by_image(
         result = cv2.matchTemplate(bg_array, puzzle_array, cv2.TM_CCOEFF_NORMED)
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
         
-        gap_x_in_bg = max_loc[0]  # 缺口在背景图中的X坐标
+        gap_x_in_bg = max_loc[0]
         log.info(f"🎯 模板匹配结果: 缺口在背景图中的位置=x={gap_x_in_bg}, 置信度={max_val:.3f}")
         
         if max_val < 0.5:
@@ -213,8 +213,11 @@ def _calculate_relative_distance_by_image(
         
         # 5. 计算相对距离：缺口位置 - 拼图块当前位置
         # 关键：在同一个坐标系内计算
-        puzzle_x_in_bg = puzzle_box['x'] - bg_box['x']  # 拼图块在背景图中的相对位置
-        relative_distance = int(gap_x_in_bg - puzzle_x_in_bg)
+        puzzle_x_in_bg = puzzle_box['x'] - bg_box['x']
+        display_width = bg_box['width']
+        image_width = int(bg_array.shape[1]) if len(bg_array.shape) >= 2 else 0
+        scale = (display_width / image_width) if image_width > 0 else 1.0
+        relative_distance = int(gap_x_in_bg * scale - puzzle_x_in_bg)
         
         log.info("\n" + "="*60)
         log.info("📊 相对坐标计算详情:")
@@ -222,7 +225,8 @@ def _calculate_relative_distance_by_image(
         log.info(f"   拼图块的iframe X坐标: {puzzle_box['x']:.0f}px")
         log.info(f"   拼图块在背景图中的相对X: {puzzle_x_in_bg:.0f}px")
         log.info(f"   缺口在背景图中的X: {gap_x_in_bg}px")
-        log.info(f"   需要移动的相对距离: {gap_x_in_bg} - {puzzle_x_in_bg:.0f} = {relative_distance}px")
+        log.info(f"   背景图显示宽度/原始宽度: {display_width:.0f}/{image_width} 比例={scale:.3f}")
+        log.info(f"   需要移动的相对距离: {gap_x_in_bg}*{scale:.3f} - {puzzle_x_in_bg:.0f} = {relative_distance}px")
         log.info("="*60 + "\n")
         
         return relative_distance
@@ -714,9 +718,13 @@ def run_registration_flow(
             except Exception as e:
                 log.warning(f"截图保存失败: {e}")
             
+            # 初始化连续失败计数器
+            consecutive_failures = 0
+            max_consecutive_failures = 2
+            
             # 通用安全操作封装
-            def element_exists(xpath: str, timeout_ms: int = 10000) -> bool:
-                """检查元素是否存在 - 使用轮询机制，默认10秒超时"""
+            def element_exists(xpath: str, timeout_ms: int = 50000) -> bool:
+                """检查元素是否存在 - 使用轮询机制，默认50秒超时"""
                 import time
                 start_time = time.time()
                 poll_interval = 0.3  # 每300毫秒检查一次
@@ -747,13 +755,14 @@ def run_registration_flow(
                 log.warning(f"⚠️ 元素未找到，超时 {elapsed}ms: {xpath[:80]}...")
                 return False
             
-            def safe_click(xpath: Optional[str], timeout_ms: int = 10000, required: bool = False) -> bool:
+            def safe_click(xpath: Optional[str], timeout_ms: int = 50000, required: bool = False) -> bool:
                 """必选/可选点击操作"""
+                global consecutive_failures
                 if not xpath:
                     log.warning("未提供XPath，跳过点击")
                     return True
                 
-                # 先检查元素是否存在（使用轮询机制，默认10秒）
+                # 先检查元素是否存在（使用轮询机制，默认50秒）
                 if not element_exists(xpath, timeout_ms=timeout_ms):
                     if required:
                         log.error(f"❌ 必需元素未找到: {xpath[:80]}...")
@@ -763,10 +772,17 @@ def run_registration_flow(
                             log.info(f"📸 截图已保存: {fp}")
                         except Exception:
                             pass
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            log.error(f"❌ 连续 {max_consecutive_failures} 个必需元素未找到，判定注册失败")
+                            return False
                         return False
                     else:
                         log.info(f"ℹ️ 可选元素未找到，跳过: {xpath[:80]}...")
                         return True
+                
+                # 元素存在，重置连续失败计数器
+                consecutive_failures = 0
                 
                 # 元素存在，等待可见并可交互
                 try:
@@ -822,13 +838,18 @@ def run_registration_flow(
                             log.info(f"📸 截图已保存: {fp}")
                         except Exception:
                             pass
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            log.error(f"❌ 连续 {max_consecutive_failures} 个必需元素操作失败，判定注册失败")
+                            return False
                         return False
                     else:
                         log.warning(f"⚠️ 可选元素点击失败 {xpath[:80]}...: {e}")
                         return True  # 可选元素不存在也返回true
 
-            def safe_fill(xpath: Optional[str], text: str, timeout_ms: int = 10000, required: bool = True) -> bool:
+            def safe_fill(xpath: Optional[str], text: str, timeout_ms: int = 50000, required: bool = True) -> bool:
                 """必选/可选填写操作"""
+                global consecutive_failures
                 if not xpath:
                     log.warning("未提供XPath，跳过填写")
                     return True if not required else False
@@ -847,9 +868,12 @@ def run_registration_flow(
                 
                 # 正序逐一尝试稍些对松的XPath
                 for try_xpath in xpaths_to_try:
-                    # 先检查元素是否存在（使用轮询机制，默认10秒）
+                    # 先检查元素是否存在（使用轮询机制，默认50秒）
                     if not element_exists(try_xpath, timeout_ms=timeout_ms):
                         continue  # 继续下一个
+                    
+                    # 元素存在，重置连续失败计数器
+                    consecutive_failures = 0
                     
                     # 元素存在，等待可见、可编辑并填写
                     try:
@@ -903,6 +927,10 @@ def run_registration_flow(
                         log.info(f"📸 截图已保存: {fp}")
                     except Exception:
                         pass
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        log.error(f"❌ 连续 {max_consecutive_failures} 个必需元素操作失败，判定注册失败")
+                        return False
                     return False
                 else:
                     log.info(f"ℹ️ 可选输入框未找到，跳过: {xpath[:80]}...")
