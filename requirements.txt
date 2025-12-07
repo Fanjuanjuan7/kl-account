@@ -7,3 +7,4 @@ PySimpleGUI>=4.60.0
 pytest>=8.3.0
 pytest-cov>=5.0.0
 pydantic>=2.8.0
+customtkinter>=5.2.2

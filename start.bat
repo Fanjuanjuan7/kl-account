@@ -67,7 +67,7 @@ if not exist ".venv" (
     )
     
     echo Installing Playwright browsers...
-    python -m playwright install chromium --quiet
+    python -m playwright install chromium
     if errorlevel 1 (
         echo [WARNING] Playwright installation failed
     )
