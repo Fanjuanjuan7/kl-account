@@ -11,7 +11,9 @@ from .automation import run_registration_flow
 # 添加全局锁，用于保护CSV文件写入
 _csv_locks: Dict[str, threading.Lock] = {}
 # 记录每个邮箱对应的窗口ID，用于失败重试时复用窗口
-_window_registry: Dict[str, str] = {}
+_pool_lock = threading.Lock()
+_failed_windows: List[str] = []
+_success_windows: List[str] = []
 
 
 def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
@@ -546,24 +548,29 @@ def register_accounts_batch(
                 log.info(f"⏹️ 检测到中断信号，取消窗口创建: {email}")
                 return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
             
-            # 复用已存在窗口，否则创建新窗口
-            if email in _window_registry and _window_registry[email]:
-                window_id = _window_registry[email]
-                log.info(f"♻️ 复用已有窗口: {window_id}")
-            else:
-                r = client.create_window(payload)
-                if not r.get("success"):
-                    data = r.get("data", {})
-                    temp_window_id = data.get("id") or ""
-                    if temp_window_id:
-                        log.warning(f"⚠️ 窗口创建API返回失败但返回了窗口ID，暂不删除: {temp_window_id}")
-                    return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
-                data = r.get("data", {})
-                window_id = data.get("id") or ""
+            window_id = None
+            try:
+                with _pool_lock:
+                    if _failed_windows:
+                        window_id = _failed_windows.pop(0)
+                        log.info(f"♻️ 复用失败窗口: {window_id}")
                 if not window_id:
-                    log.error("❌ 窗口创建成功但未返回窗口ID")
-                    return (False, email, "FAIL: No window ID", None)
-                _window_registry[email] = window_id
+                    r = client.create_window(payload)
+                    if not r.get("success"):
+                        data = r.get("data", {})
+                        temp_window_id = data.get("id") or ""
+                        if temp_window_id:
+                            log.warning(f"⚠️ 窗口创建API返回失败但返回了窗口ID，暂不删除: {temp_window_id}")
+                        return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
+                    data = r.get("data", {})
+                    window_id = data.get("id") or ""
+                    if not window_id:
+                        log.error("❌ 窗口创建成功但未返回窗口ID")
+                        return (False, email, "FAIL: No window ID", None)
+                    log.info(f"🆕 创建新窗口: {window_id}")
+            except Exception as acquire_err:
+                log.error(f"❌ 获取窗口失败: {acquire_err}")
+                return (False, email, f"ERROR {email}: {acquire_err}", None)
             
             # 检查中断标志（在打开窗口前检查）
             if stop_flag and stop_flag.get("stop", False):
@@ -651,6 +658,16 @@ def register_accounts_batch(
                             log.warning(f"⚠️ 关闭窗口失败: {close_result.get('msg')}")
                     except Exception as close_err:
                         log.error(f"❌ 关闭窗口异常: {close_err}")
+                try:
+                    with _pool_lock:
+                        if window_id and window_id not in _success_windows:
+                            _success_windows.append(window_id)
+                        try:
+                            _failed_windows.remove(window_id)
+                        except ValueError:
+                            pass
+                except Exception as pool_err:
+                    log.warning(f"⚠️ 成功池更新失败: {pool_err}")
                 return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
             else:
                 # 注册失败，仅关闭窗口，不删除；保留用于重试
@@ -658,6 +675,14 @@ def register_accounts_batch(
                     try:
                         log.info(f"⚠️ 注册失败，关闭窗口以供重试: {window_id}")
                         client.close_window(window_id)
+                        with _pool_lock:
+                            if window_id not in _failed_windows:
+                                _failed_windows.append(window_id)
+                            try:
+                                _success_windows.remove(window_id)
+                            except ValueError:
+                                pass
+                        log.info(f"📦 失败窗口池大小: {len(_failed_windows)}")
                     except Exception as close_err:
                         log.warning(f"⚠️ 关闭失败窗口异常: {close_err}")
                 return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", window_id)
@@ -667,8 +692,19 @@ def register_accounts_batch(
             log.error(f"❌ 注册过程发生异常: {e}")
             if window_id:
                 log.info(f"🧹 异常发生，清理窗口: {window_id}")
-                # 增强清理逻辑：确保窗口被彻底清理
                 force_cleanup_window(client, window_id, bitbrowser_password, log)
+                try:
+                    with _pool_lock:
+                        try:
+                            _failed_windows.remove(window_id)
+                        except ValueError:
+                            pass
+                        try:
+                            _success_windows.remove(window_id)
+                        except ValueError:
+                            pass
+                except Exception as pool_err:
+                    log.warning(f"⚠️ 清理池更新失败: {pool_err}")
             return (False, email, f"ERROR {email}: {e}", None)
     
     # 使用线程池并发执行

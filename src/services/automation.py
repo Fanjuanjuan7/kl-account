@@ -755,185 +755,217 @@ def run_registration_flow(
                 log.warning(f"⚠️ 元素未找到，超时 {elapsed}ms: {xpath[:80]}...")
                 return False
             
+            def wait_for_success_indicator(timeout_ms: int = 30000, stability_rounds_env: Optional[str] = None) -> Optional[str]:
+                import os
+                import time
+                start = time.time()
+                primary = "//*[local-name()='svg' and normalize-space(@xmlns)='http://www.w3.org/2000/svg'][4]"
+                any_svg = "//*[local-name()='svg' and normalize-space(@xmlns)='http://www.w3.org/2000/svg']"
+                fallback_dialog = "//div[@class='el-dialog is-align-center kling-dialog dialog-bg kling-dialog']"
+                rounds = 0
+                try:
+                    ns_count = page.evaluate(
+                        "Array.from(document.querySelectorAll('svg')).filter(s => (s && s.namespaceURI==='http://www.w3.org/2000/svg')).length"
+                    )
+                    log.info(f"success_ns_svg_count={ns_count}")
+                except Exception:
+                    pass
+                while (time.time() - start) * 1000 < timeout_ms:
+                    if element_exists(primary, timeout_ms=1000):
+                        return primary
+                    try:
+                        cnt = page.locator(f"xpath={any_svg}").count()
+                        log.info(f"success_svg_any_count={cnt}")
+                    except Exception:
+                        cnt = 0
+                    if cnt > 0:
+                        return any_svg
+                    if element_exists(fallback_dialog, timeout_ms=1000):
+                        return fallback_dialog
+                    time.sleep(0.5)
+                env_val = os.environ.get(stability_rounds_env or "KL_SUCCESS_STABILITY_TEST", "0")
+                try_rounds = 5 if env_val == "1" else 0
+                for i in range(try_rounds):
+                    rounds += 1
+                    log.info(f"stability_round={rounds} action=reload")
+                    try:
+                        page.reload(timeout=30000, wait_until="domcontentloaded")
+                        time.sleep(1)
+                    except Exception:
+                        pass
+                    try:
+                        ns_count2 = page.evaluate(
+                            "Array.from(document.querySelectorAll('svg')).filter(s => (s && s.namespaceURI==='http://www.w3.org/2000/svg')).length"
+                        )
+                        log.info(f"success_ns_svg_count_after_reload={ns_count2}")
+                    except Exception:
+                        pass
+                    if element_exists(primary, timeout_ms=3000):
+                        return primary
+                    try:
+                        cnt2 = page.locator(f"xpath={any_svg}").count()
+                        log.info(f"success_svg_any_count_after_reload={cnt2}")
+                        if cnt2 > 0:
+                            return any_svg
+                    except Exception:
+                        pass
+                    if element_exists(fallback_dialog, timeout_ms=3000):
+                        return fallback_dialog
+                return None
+
             def safe_click(xpath: Optional[str], timeout_ms: int = 50000, required: bool = False) -> bool:
-                """必选/可选点击操作"""
                 global consecutive_failures
                 if not xpath:
-                    log.warning("未提供XPath，跳过点击")
                     return True
-                
-                # 先检查元素是否存在（使用轮询机制，默认50秒）
-                if not element_exists(xpath, timeout_ms=timeout_ms):
-                    if required:
-                        log.error(f"❌ 必需元素未找到: {xpath[:80]}...")
-                        try:
-                            fp = runtime_dir / f"shot_element_not_found_{int(time.time()*1000)}.png"
-                            page.screenshot(path=str(fp))
-                            log.info(f"📸 截图已保存: {fp}")
-                        except Exception:
-                            pass
-                        consecutive_failures += 1
-                        if consecutive_failures >= max_consecutive_failures:
-                            log.error(f"❌ 连续 {max_consecutive_failures} 个必需元素未找到，判定注册失败")
-                            return False
-                        return False
-                    else:
-                        log.info(f"ℹ️ 可选元素未找到，跳过: {xpath[:80]}...")
-                        return True
-                
-                # 元素存在，重置连续失败计数器
-                consecutive_failures = 0
-                
-                # 元素存在，等待可见并可交互
-                try:
-                    log.info(f"👆 准备点击: {xpath[:80]}...")
-                    loc = page.locator(f"xpath={xpath}")
-                    
-                    # 等待元素可见
-                    log.info(f"⏳ 等待元素可见...")
-                    loc.wait_for(state="visible", timeout=timeout_ms)
-                    
-                    # 滚动到元素位置
-                    try:
-                        loc.scroll_into_view_if_needed(timeout=3000)
-                        log.info(f"✅ 已滚动到元素位置")
-                    except Exception as scroll_err:
-                        log.warning(f"⚠️ 滚动失败: {scroll_err}")
-                    
-                    # 尝试正常点击
-                    try:
-                        loc.click(timeout=5000)
-                        log.info(f"✅ 点击成功: {xpath[:80]}...")
-                        return True
-                    except Exception as click_err:
-                        # 如果被遮挡，尝试强制点击
-                        if "intercepts pointer events" in str(click_err) or "not clickable" in str(click_err):
-                            log.warning(f"⚠️ 元素被遮挡，尝试强制点击...")
+                retries = 3
+                for attempt in range(1, retries + 1):
+                    ts = int(time.time() * 1000)
+                    log.info(f"attempt={attempt} ts={ts} method=xpath target={xpath[:80]} state=locating")
+                    if not element_exists(xpath, timeout_ms=timeout_ms):
+                        if attempt < retries:
+                            time.sleep(2)
+                            continue
+                        if required:
                             try:
-                                # 使用JavaScript强制点击
-                                page.evaluate(f'''
-                                    (xpath) => {{
-                                        const element = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                                        if (element) {{
-                                            element.click();
-                                            return true;
-                                        }}
-                                        return false;
-                                    }}
-                                ''', xpath)
-                                log.info(f"✅ JavaScript强制点击成功: {xpath[:80]}...")
-                                return True
-                            except Exception as force_err:
-                                log.warning(f"⚠️ 强制点击也失败: {force_err}")
-                                raise click_err
+                                fp = runtime_dir / f"shot_element_not_found_{ts}.png"
+                                page.screenshot(path=str(fp))
+                                log.info(f"saved={fp}")
+                            except Exception:
+                                pass
+                            consecutive_failures += 1
+                            msg = f"required element not found: {xpath[:80]}"
+                            raise Exception(msg)
                         else:
-                            raise
-                    
-                except Exception as e:
-                    if required:
-                        log.error(f"❌ 必需元素点击失败 {xpath[:80]}...: {e}")
+                            return True
+                    consecutive_failures = 0
+                    try:
+                        loc = page.locator(f"xpath={xpath}")
+                        loc.wait_for(state="visible", timeout=timeout_ms)
                         try:
-                            fp = runtime_dir / f"shot_click_fail_{int(time.time()*1000)}.png"
-                            page.screenshot(path=str(fp))
-                            log.info(f"📸 截图已保存: {fp}")
+                            loc.scroll_into_view_if_needed(timeout=3000)
                         except Exception:
                             pass
-                        consecutive_failures += 1
-                        if consecutive_failures >= max_consecutive_failures:
-                            log.error(f"❌ 连续 {max_consecutive_failures} 个必需元素操作失败，判定注册失败")
-                            return False
-                        return False
-                    else:
-                        log.warning(f"⚠️ 可选元素点击失败 {xpath[:80]}...: {e}")
-                        return True  # 可选元素不存在也返回true
+                        try:
+                            loc.click(timeout=5000)
+                            log.info(f"attempt={attempt} ts={ts} method=xpath target={xpath[:80]} state=clicked")
+                            return True
+                        except Exception as click_err:
+                            if "intercepts pointer events" in str(click_err) or "not clickable" in str(click_err):
+                                try:
+                                    page.evaluate(
+                                        """
+                                        (xpath) => {
+                                            const n = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                            if (n) { n.click(); return true; }
+                                            return false;
+                                        }
+                                        """,
+                                        xpath,
+                                    )
+                                    log.info(f"attempt={attempt} ts={ts} method=js target={xpath[:80]} state=clicked")
+                                    return True
+                                except Exception:
+                                    pass
+                            if attempt < retries:
+                                time.sleep(2)
+                                continue
+                            if required:
+                                try:
+                                    fp = runtime_dir / f"shot_click_fail_{ts}.png"
+                                    page.screenshot(path=str(fp))
+                                    log.info(f"saved={fp}")
+                                except Exception:
+                                    pass
+                                consecutive_failures += 1
+                                msg = f"required click failed: {xpath[:80]}"
+                                raise Exception(msg)
+                            else:
+                                return True
+                    except Exception as e:
+                        if attempt < retries:
+                            time.sleep(2)
+                            continue
+                        if required:
+                            try:
+                                fp = runtime_dir / f"shot_click_fail_{ts}.png"
+                                page.screenshot(path=str(fp))
+                                log.info(f"saved={fp}")
+                            except Exception:
+                                pass
+                            consecutive_failures += 1
+                            msg = f"required click failed: {xpath[:80]}"
+                            raise Exception(msg)
+                        else:
+                            return True
 
             def safe_fill(xpath: Optional[str], text: str, timeout_ms: int = 50000, required: bool = True) -> bool:
-                """必选/可选填写操作"""
                 global consecutive_failures
                 if not xpath:
-                    log.warning("未提供XPath，跳过填写")
                     return True if not required else False
-                
-                # 扩展的元素查找 - 尝试处理XPath不完全匹配的情况
                 xpaths_to_try = [xpath]
-                
-                # 如果是邮箱输入框，添加更丰的匹配
                 if 'email' in xpath.lower() or 'Email' in xpath:
                     xpaths_to_try.extend([
                         "//*[contains(@placeholder, 'mail')]",
                         "//input[@type='email']",
                         "//input[contains(@class, 'email')]",
                         "//input[contains(@name, 'email')]",
+                        "//input[@placeholder='Email address']",
+                        "//input[@aria-label='Email address']",
+                        "//label[contains(., 'Email')]/following::input[1]",
+                        "//input[@id='email']",
                     ])
-                
-                # 正序逐一尝试稍些对松的XPath
+                retries = 3
                 for try_xpath in xpaths_to_try:
-                    # 先检查元素是否存在（使用轮询机制，默认50秒）
-                    if not element_exists(try_xpath, timeout_ms=timeout_ms):
-                        continue  # 继续下一个
-                    
-                    # 元素存在，重置连续失败计数器
-                    consecutive_failures = 0
-                    
-                    # 元素存在，等待可见、可编辑并填写
-                    try:
-                        masked_text = text[:3] + '***' if len(text) > 3 else '***'
-                        log.info(f"✏️ 准备填写: {try_xpath[:80]}... (隐藏值: {masked_text})")
-                        loc = page.locator(f"xpath={try_xpath}")
-                        
-                        # 等待元素可见
-                        log.info(f"⏳ 等待输入框可见...")
-                        loc.wait_for(state="visible", timeout=timeout_ms)
-                        
-                        # 滚动到元素位置
+                    for attempt in range(1, retries + 1):
+                        ts = int(time.time() * 1000)
+                        log.info(f"attempt={attempt} ts={ts} method=xpath target={try_xpath[:80]} state=locating")
+                        if not element_exists(try_xpath, timeout_ms=timeout_ms):
+                            if attempt < retries:
+                                time.sleep(2)
+                                continue
+                            break
+                        consecutive_failures = 0
                         try:
-                            loc.scroll_into_view_if_needed(timeout=3000)
-                            log.info(f"✅ 输入框已滚动到视图内")
-                        except Exception as scroll_err:
-                            log.warning(f"⚠️ 滚动失败: {scroll_err}")
-                        
-                        # 点击聚焦后填写
-                        try:
-                            loc.click(timeout=3000)  # 先点击聚焦
-                            log.info(f"✅ 输入框已聚焦")
-                        except Exception:
-                            pass  # 点击失败不影响填写
-                        
-                        # 清空后填写
-                        loc.fill(text, timeout=5000)
-                        log.info(f"✅ 填写成功: {try_xpath[:80]}...")
-                        
-                        # 验证填写是否成功
-                        try:
-                            filled_value = loc.input_value(timeout=2000)
-                            if filled_value == text:
-                                log.info(f"✅ 验证成功: 输入值匹配")
-                            else:
-                                log.warning(f"⚠️ 输入值不匹配: 预期长度 {len(text)}, 实际长度 {len(filled_value)}")
-                        except Exception as verify_err:
-                            log.warning(f"⚠️ 验证输入值失败: {verify_err}")
-                        
-                        return True
-                    except Exception as e:
-                        log.warning(f"⚠️ XPath '{try_xpath[:60]}' 填写失败: {e}")
-                        continue  # 继续下一个
-                
-                # 所有XPath都失败
+                            loc = page.locator(f"xpath={try_xpath}")
+                            loc.wait_for(state="visible", timeout=timeout_ms)
+                            try:
+                                loc.scroll_into_view_if_needed(timeout=3000)
+                            except Exception:
+                                pass
+                            try:
+                                loc.click(timeout=3000)
+                            except Exception:
+                                pass
+                            loc.fill(text, timeout=5000)
+                            try:
+                                filled_value = loc.input_value(timeout=2000)
+                                if filled_value == text:
+                                    log.info(f"attempt={attempt} ts={ts} method=xpath target={try_xpath[:80]} state=filled")
+                                    return True
+                            except Exception:
+                                pass
+                            if attempt < retries:
+                                time.sleep(2)
+                                continue
+                            break
+                        except Exception as e:
+                            if attempt < retries:
+                                time.sleep(2)
+                                continue
+                            break
+                    continue
                 if required:
-                    log.error(f"❌ 必需输入框未找到: {xpath[:80]}...")
+                    ts = int(time.time() * 1000)
                     try:
-                        fp = runtime_dir / f"shot_input_not_found_{int(time.time()*1000)}.png"
+                        fp = runtime_dir / f"shot_input_not_found_{ts}.png"
                         page.screenshot(path=str(fp), full_page=True)
-                        log.info(f"📸 截图已保存: {fp}")
+                        log.info(f"saved={fp}")
                     except Exception:
                         pass
                     consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        log.error(f"❌ 连续 {max_consecutive_failures} 个必需元素操作失败，判定注册失败")
-                        return False
-                    return False
+                    msg = f"required input not found: {xpath[:80]}"
+                    raise Exception(msg)
                 else:
-                    log.info(f"ℹ️ 可选输入框未找到，跳过: {xpath[:80]}...")
                     return True
 
             # ... existing code ...
@@ -1443,9 +1475,37 @@ def run_registration_flow(
                                 
                                 if submit_success:
                                     log.info("✅ Final submit button clicked successfully")
-                                    # 等待注册完成
-                                    log.info("⏳ Waiting for registration to complete...")
-                                    time.sleep(5)
+                                    log.info("⏳ Waiting for success indicator up to 30s...")
+                                    success_xpath = wait_for_success_indicator(timeout_ms=30000)
+                                    if success_xpath:
+                                        ts = int(time.time()*1000)
+                                        try:
+                                            fp = runtime_dir / f"shot_success_{ts}.png"
+                                            page.screenshot(path=str(fp), full_page=True)
+                                            log.info(f"success_ts={ts} saved={fp}")
+                                        except Exception:
+                                            pass
+                                        if browser_mode == "playwright":
+                                            try:
+                                                if page:
+                                                    page.close()
+                                                if context:
+                                                    context.close()
+                                                if browser:
+                                                    browser.close()
+                                                log.info("✅ Browser closed successfully")
+                                            except Exception:
+                                                pass
+                                        return True
+                                    else:
+                                        ts = int(time.time()*1000)
+                                        try:
+                                            fp = runtime_dir / f"shot_success_wait_timeout_{ts}.png"
+                                            page.screenshot(path=str(fp), full_page=True)
+                                            log.info(f"timeout_ts={ts} saved={fp}")
+                                        except Exception:
+                                            pass
+                                        raise Exception("registration success indicator not detected within 30s")
                                 else:
                                     log.error("❌ Failed to click final submit button")
                                     return False
@@ -1473,10 +1533,40 @@ def run_registration_flow(
                 log.info("⚠️ No code_url provided, waiting for manual input")
                 final_submit_btn = xpaths.get("final_submit_btn")
                 if final_submit_btn:
-                    # 等待30秒让用户手动输入
                     log.info("⏳ Waiting 30 seconds for manual code input...")
                     log.info("👉 Please manually input verification code in the browser")
                     time.sleep(30)
+                    log.info("🔍 Checking success indicator after manual submit...")
+                    success_xpath = wait_for_success_indicator(timeout_ms=30000)
+                    if success_xpath:
+                        ts = int(time.time()*1000)
+                        try:
+                            fp = runtime_dir / f"shot_success_{ts}.png"
+                            page.screenshot(path=str(fp), full_page=True)
+                            log.info(f"success_ts={ts} saved={fp}")
+                        except Exception:
+                            pass
+                        if browser_mode == "playwright":
+                            try:
+                                if page:
+                                    page.close()
+                                if context:
+                                    context.close()
+                                if browser:
+                                    browser.close()
+                                log.info("✅ Browser closed successfully")
+                            except Exception:
+                                pass
+                        return True
+                    else:
+                        ts = int(time.time()*1000)
+                        try:
+                            fp = runtime_dir / f"shot_success_wait_timeout_{ts}.png"
+                            page.screenshot(path=str(fp), full_page=True)
+                            log.info(f"timeout_ts={ts} saved={fp}")
+                        except Exception:
+                            pass
+                        raise Exception("registration success indicator not detected within 30s")
             else:
                 log.warning("⚠️ No verification code XPath configured, skipping verification")
             
@@ -1538,14 +1628,7 @@ def run_registration_flow(
         log.info("⏸️ Error occurred. Keeping browser open for 30 seconds for debugging...")
         time.sleep(30)
         
-        # 温和关闭浏览器
         if browser_mode == "playwright":
-            try:
-                if 'browser' in locals() and browser is not None:
-                    log.info("🔒 Closing browser after error...")
-                    browser.close()
-                    log.info("✅ Browser closed")
-            except Exception as close_err:
-                log.warning(f"⚠️ Browser close error (can be ignored): {close_err}")
+            log.info("👁️ Browser will remain open for debugging")
         
         return False
