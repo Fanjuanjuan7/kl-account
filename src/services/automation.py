@@ -1418,13 +1418,22 @@ def run_registration_flow(
                             
                             # 点击提交按钮
                             final_submit_btn = xpaths.get("final_submit_btn")
-                            if not final_submit_btn:
-                                log.error("❌ No final_submit_btn XPath specified")
-                                return False
-                            log.info(f"👆 Clicking final submit button: {final_submit_btn[:80]}...")
-                            submit_success = safe_click(final_submit_btn, timeout_ms=10000, required=True)
-                            if not submit_success:
-                                log.error("❌ Failed to click final submit button")
+                            candidates = []
+                            if final_submit_btn:
+                                candidates.append(final_submit_btn)
+                            candidates.append("//*[@class='generic-button critical big']")
+                            candidates.append("//*[contains(@class,'generic-button') and contains(@class,'critical')]//*[text()='Submit' or text()='Next']")
+                            clicked = False
+                            for cand in candidates:
+                                try:
+                                    if element_exists(cand, timeout_ms=5000):
+                                        if safe_click(cand, timeout_ms=10000, required=False):
+                                            clicked = True
+                                            break
+                                except Exception:
+                                    pass
+                            if not clicked:
+                                log.error("❌ Final submit button not found or not clickable")
                                 return False
                             # 执行注册后验证与生成流程（以Images元素为唯一成功标准）
                             def verify_images_success() -> bool:
@@ -1465,13 +1474,26 @@ def run_registration_flow(
                 # 如果没有code_url，但有code_input，则等待用户手动输入
                 log.info("⚠️ No code_url provided, waiting for manual input")
                 final_submit_btn = xpaths.get("final_submit_btn")
-                if final_submit_btn:
+                if final_submit_btn or True:
                     log.info("⏳ Waiting 30 seconds for manual code input...")
                     log.info("👉 Please manually input verification code in the browser")
                     time.sleep(30)
                     log.info("🔍 Submitting and verifying by Images element...")
-                    submit_success = safe_click(final_submit_btn, timeout_ms=10000, required=True)
-                    if not submit_success:
+                    candidates = []
+                    if final_submit_btn:
+                        candidates.append(final_submit_btn)
+                    candidates.append("//*[@class='generic-button critical big']")
+                    candidates.append("//*[contains(@class,'generic-button') and contains(@class,'critical')]//*[text()='Submit' or text()='Next']")
+                    clicked = False
+                    for cand in candidates:
+                        try:
+                            if element_exists(cand, timeout_ms=5000):
+                                if safe_click(cand, timeout_ms=10000, required=False):
+                                    clicked = True
+                                    break
+                        except Exception:
+                            pass
+                    if not clicked:
                         return False
                     def verify_images_success_manual() -> bool:
                         close_svg = xpaths.get("close_popup_svg")
