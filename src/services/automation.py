@@ -755,63 +755,6 @@ def run_registration_flow(
                 log.warning(f"⚠️ 元素未找到，超时 {elapsed}ms: {xpath[:80]}...")
                 return False
             
-            def wait_for_success_indicator(timeout_ms: int = 30000, stability_rounds_env: Optional[str] = None) -> Optional[str]:
-                import os
-                import time
-                start = time.time()
-                primary = "//*[local-name()='svg' and normalize-space(@xmlns)='http://www.w3.org/2000/svg'][4]"
-                any_svg = "//*[local-name()='svg' and normalize-space(@xmlns)='http://www.w3.org/2000/svg']"
-                fallback_dialog = "//div[@class='el-dialog is-align-center kling-dialog dialog-bg kling-dialog']"
-                rounds = 0
-                try:
-                    ns_count = page.evaluate(
-                        "Array.from(document.querySelectorAll('svg')).filter(s => (s && s.namespaceURI==='http://www.w3.org/2000/svg')).length"
-                    )
-                    log.info(f"success_ns_svg_count={ns_count}")
-                except Exception:
-                    pass
-                while (time.time() - start) * 1000 < timeout_ms:
-                    if element_exists(primary, timeout_ms=1000):
-                        return primary
-                    try:
-                        cnt = page.locator(f"xpath={any_svg}").count()
-                        log.info(f"success_svg_any_count={cnt}")
-                    except Exception:
-                        cnt = 0
-                    if cnt > 0:
-                        return any_svg
-                    if element_exists(fallback_dialog, timeout_ms=1000):
-                        return fallback_dialog
-                    time.sleep(0.5)
-                env_val = os.environ.get(stability_rounds_env or "KL_SUCCESS_STABILITY_TEST", "0")
-                try_rounds = 5 if env_val == "1" else 0
-                for i in range(try_rounds):
-                    rounds += 1
-                    log.info(f"stability_round={rounds} action=reload")
-                    try:
-                        page.reload(timeout=30000, wait_until="domcontentloaded")
-                        time.sleep(1)
-                    except Exception:
-                        pass
-                    try:
-                        ns_count2 = page.evaluate(
-                            "Array.from(document.querySelectorAll('svg')).filter(s => (s && s.namespaceURI==='http://www.w3.org/2000/svg')).length"
-                        )
-                        log.info(f"success_ns_svg_count_after_reload={ns_count2}")
-                    except Exception:
-                        pass
-                    if element_exists(primary, timeout_ms=3000):
-                        return primary
-                    try:
-                        cnt2 = page.locator(f"xpath={any_svg}").count()
-                        log.info(f"success_svg_any_count_after_reload={cnt2}")
-                        if cnt2 > 0:
-                            return any_svg
-                    except Exception:
-                        pass
-                    if element_exists(fallback_dialog, timeout_ms=3000):
-                        return fallback_dialog
-                return None
 
             def safe_click(xpath: Optional[str], timeout_ms: int = 50000, required: bool = False) -> bool:
                 global consecutive_failures
@@ -996,9 +939,13 @@ def run_registration_flow(
             if signin_btn and not login_entry_found:
                 # 等待一下确保弹窗关闭完成
                 time.sleep(2)
-                if safe_click(signin_btn, timeout_ms=10000, required=False):
+                if safe_click(signin_btn, timeout_ms=10000, required=True):
                     log.info("✅ Sign In 按钮已点击，等待响应...")
-                    time.sleep(3)  # 等待页面响应
+                    time.sleep(3)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=20000)
+                    except Exception:
+                        pass
                     
                     # 确认点击是否生效（截图验证）
                     try:
@@ -1010,7 +957,7 @@ def run_registration_flow(
             elif login_entry_found:
                 log.info("ℹ️ 已通过其他方式进入登录流程，跳过 Sign In 按钮")
             else:
-                log.warning("⚠️ XPath配置中未定义 signin_btn")
+                raise Exception("signin_btn 未配置，无法继续")
             
             log.info("\n" + "="*60)
             log.info("步骤3: 选择邮箱登录方式 (signin_with_email)")
@@ -1020,9 +967,13 @@ def run_registration_flow(
             email_login_clicked = False
             if signin_with_email:
                 time.sleep(2)
-                if safe_click(signin_with_email, timeout_ms=10000, required=False):
+                if safe_click(signin_with_email, timeout_ms=10000, required=True):
                     log.info("✅ 邮箱登录选项已点击，等待表单加载...")
-                    time.sleep(5)  # 增加等待时间到5秒，确保表单完全渲染
+                    time.sleep(5)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=20000)
+                    except Exception:
+                        pass
                     email_login_clicked = True
                     
                     # 滚动页面确保表单在视口内
@@ -1043,7 +994,7 @@ def run_registration_flow(
                 else:
                     log.warning("⚠️ 邮箱登录选项未找到或点击失败")
             else:
-                log.warning("⚠️ XPath配置中未定义邮箱登录选项")
+                raise Exception("signin_with_email 未配置，无法继续")
             
             log.info("\n" + "="*60)
             log.info("步骤4: 点击注册链接 (Sign up for free)")
@@ -1055,7 +1006,7 @@ def run_registration_flow(
             if signup_link:
                 time.sleep(2)
                 # 尝试点击注册链接
-                if safe_click(signup_link, timeout_ms=15000, required=False):
+                if safe_click(signup_link, timeout_ms=15000, required=True):
                     log.info("✅ 注册链接点击命令执行成功")
                     time.sleep(3)  # 等待3秒
                     
@@ -1333,8 +1284,6 @@ def run_registration_flow(
                     if slider_success:
                         log.info("✅ 滑块验证成功")
                         slider_solved = True
-                    else:
-                        log.warning("⚠️ 滑块验证失败")
             else:
                 log.info("ℹ️ 未配置滑块XPath，跳过")
                 slider_solved = True  # 没有滑块配置，认为不需要验证
@@ -1469,49 +1418,33 @@ def run_registration_flow(
                             
                             # 点击提交按钮
                             final_submit_btn = xpaths.get("final_submit_btn")
-                            if final_submit_btn:
-                                log.info(f"👆 Clicking final submit button: {final_submit_btn[:80]}...")
-                                submit_success = safe_click(final_submit_btn, timeout_ms=10000, required=True)
-                                
-                                if submit_success:
-                                    log.info("✅ Final submit button clicked successfully")
-                                    log.info("⏳ Waiting for success indicator up to 30s...")
-                                    success_xpath = wait_for_success_indicator(timeout_ms=30000)
-                                    if success_xpath:
-                                        ts = int(time.time()*1000)
-                                        try:
-                                            fp = runtime_dir / f"shot_success_{ts}.png"
-                                            page.screenshot(path=str(fp), full_page=True)
-                                            log.info(f"success_ts={ts} saved={fp}")
-                                        except Exception:
-                                            pass
-                                        if browser_mode == "playwright":
-                                            try:
-                                                if page:
-                                                    page.close()
-                                                if context:
-                                                    context.close()
-                                                if browser:
-                                                    browser.close()
-                                                log.info("✅ Browser closed successfully")
-                                            except Exception:
-                                                pass
-                                        return True
-                                    else:
-                                        ts = int(time.time()*1000)
-                                        try:
-                                            fp = runtime_dir / f"shot_success_wait_timeout_{ts}.png"
-                                            page.screenshot(path=str(fp), full_page=True)
-                                            log.info(f"timeout_ts={ts} saved={fp}")
-                                        except Exception:
-                                            pass
-                                        raise Exception("registration success indicator not detected within 30s")
-                                else:
-                                    log.error("❌ Failed to click final submit button")
-                                    return False
-                            else:
+                            if not final_submit_btn:
                                 log.error("❌ No final_submit_btn XPath specified")
                                 return False
+                            log.info(f"👆 Clicking final submit button: {final_submit_btn[:80]}...")
+                            submit_success = safe_click(final_submit_btn, timeout_ms=10000, required=True)
+                            if not submit_success:
+                                log.error("❌ Failed to click final submit button")
+                                return False
+                            # 执行注册后验证与生成流程（以Images元素为唯一成功标准）
+                            def verify_images_success() -> bool:
+                                close_svg = xpaths.get("close_popup_svg")
+                                if close_svg:
+                                    safe_click(close_svg, timeout_ms=5000, required=False)
+                                tab = xpaths.get("text_to_image_tab")
+                                if tab:
+                                    safe_click(tab, timeout_ms=10000, required=False)
+                                prompt = xpaths.get("prompt_input")
+                                if prompt:
+                                    safe_fill(prompt, "a girl", timeout_ms=10000, required=False)
+                                gen_btn = xpaths.get("generate_btn")
+                                if gen_btn:
+                                    safe_click(gen_btn, timeout_ms=10000, required=False)
+                                images = xpaths.get("images_header")
+                                if images and element_exists(images, timeout_ms=30000):
+                                    return True
+                                raise Exception("POPUP_DETECTED")
+                            return verify_images_success()
                         else:
                             log.error("❌ Failed to fill verification code")
                             return False
@@ -1536,71 +1469,51 @@ def run_registration_flow(
                     log.info("⏳ Waiting 30 seconds for manual code input...")
                     log.info("👉 Please manually input verification code in the browser")
                     time.sleep(30)
-                    log.info("🔍 Checking success indicator after manual submit...")
-                    success_xpath = wait_for_success_indicator(timeout_ms=30000)
-                    if success_xpath:
-                        ts = int(time.time()*1000)
-                        try:
-                            fp = runtime_dir / f"shot_success_{ts}.png"
-                            page.screenshot(path=str(fp), full_page=True)
-                            log.info(f"success_ts={ts} saved={fp}")
-                        except Exception:
-                            pass
-                        if browser_mode == "playwright":
-                            try:
-                                if page:
-                                    page.close()
-                                if context:
-                                    context.close()
-                                if browser:
-                                    browser.close()
-                                log.info("✅ Browser closed successfully")
-                            except Exception:
-                                pass
+                    log.info("🔍 Submitting and verifying by Images element...")
+                    submit_success = safe_click(final_submit_btn, timeout_ms=10000, required=True)
+                    if not submit_success:
+                        return False
+                    def verify_images_success_manual() -> bool:
+                        close_svg = xpaths.get("close_popup_svg")
+                        if close_svg:
+                            safe_click(close_svg, timeout_ms=5000, required=False)
+                        tab = xpaths.get("text_to_image_tab")
+                        if tab:
+                            safe_click(tab, timeout_ms=10000, required=False)
+                        prompt = xpaths.get("prompt_input")
+                        if prompt:
+                            safe_fill(prompt, "a girl", timeout_ms=10000, required=False)
+                        gen_btn = xpaths.get("generate_btn")
+                        if gen_btn:
+                            safe_click(gen_btn, timeout_ms=10000, required=False)
+                        images = xpaths.get("images_header")
+                        if images and element_exists(images, timeout_ms=30000):
+                            return True
+                        raise Exception("POPUP_DETECTED")
+                    return verify_images_success_manual()
+            else:
+                log.warning("⚠️ No verification code XPath configured, verifying by Images element")
+                def verify_images_success_nocode() -> bool:
+                    close_svg = xpaths.get("close_popup_svg")
+                    if close_svg:
+                        safe_click(close_svg, timeout_ms=5000, required=False)
+                    tab = xpaths.get("text_to_image_tab")
+                    if tab:
+                        safe_click(tab, timeout_ms=10000, required=False)
+                    prompt = xpaths.get("prompt_input")
+                    if prompt:
+                        safe_fill(prompt, "a girl", timeout_ms=10000, required=False)
+                    gen_btn = xpaths.get("generate_btn")
+                    if gen_btn:
+                        safe_click(gen_btn, timeout_ms=10000, required=False)
+                    images = xpaths.get("images_header")
+                    if images and element_exists(images, timeout_ms=30000):
                         return True
-                    else:
-                        ts = int(time.time()*1000)
-                        try:
-                            fp = runtime_dir / f"shot_success_wait_timeout_{ts}.png"
-                            page.screenshot(path=str(fp), full_page=True)
-                            log.info(f"timeout_ts={ts} saved={fp}")
-                        except Exception:
-                            pass
-                        raise Exception("registration success indicator not detected within 30s")
-            else:
-                log.warning("⚠️ No verification code XPath configured, skipping verification")
-            
-            try:
-                fp = runtime_dir / f"shot_done_{int(time.time()*1000)}.png"
-                page.screenshot(path=str(fp))
-                log.info(f"🎉 Registration completed! Final screenshot saved: {fp}")
-            except Exception:
-                pass
-            
-            # 不立即关闭浏览器，给用户时间查看结果
-            log.info("⏸️ Keeping browser open for 30 seconds to review results...")
-            log.info("🔍 You can manually close the browser or wait for auto-close")
-            time.sleep(30)  # 等待30秒让用户查看结果
-            
-            # Playwright模式：温和关闭浏览器
-            if browser_mode == "playwright":
-                try:
-                    log.info("🔒 Closing browser gracefully...")
-                    if page:
-                        page.close()
-                    if context:
-                        context.close()
-                    if browser:
-                        browser.close()
-                    log.info("✅ Browser closed successfully")
-                except Exception as close_err:
-                    log.warning(f"Browser close error (can be ignored): {close_err}")
-            else:
-                # 比特浏览器模式：不关闭浏览器，由用户手动关闭
-                log.info("👁️ BitBrowser mode: browser will remain open")
-            
-        return True
+                    raise Exception("POPUP_DETECTED")
+                return verify_images_success_nocode()
     except Exception as e:
+        if str(e) == "POPUP_DETECTED":
+            raise
         log.error(f"❌ Automation error: {e}")
         import traceback
         log.error(traceback.format_exc())

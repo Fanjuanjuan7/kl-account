@@ -2,6 +2,7 @@ from pathlib import Path
 import csv
 import time
 import threading
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Dict, Any
 from ..utils.logger import get_logger
@@ -10,10 +11,7 @@ from .automation import run_registration_flow
 
 # 添加全局锁，用于保护CSV文件写入
 _csv_locks: Dict[str, threading.Lock] = {}
-# 记录每个邮箱对应的窗口ID，用于失败重试时复用窗口
-_pool_lock = threading.Lock()
-_failed_windows: List[str] = []
-_success_windows: List[str] = []
+ 
 
 
 def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
@@ -107,8 +105,8 @@ def load_accounts_csv(csv_path: Path, skip_success: bool = True) -> List[Dict[st
                 # 检查第9列状态（索引8）
                 status = row[8].strip() if len(row) >= 9 else ""
                 
-                # 如果skip_success=True，跳过状态为"成功"的行
-                if skip_success and status == "成功":
+                # 如果skip_success=True，跳过状态为"成功"或"弹窗"的行
+                if skip_success and status in ("成功", "弹窗"):
                     continue
                 
                 rec: Dict[str, Any] = {
@@ -550,26 +548,17 @@ def register_accounts_batch(
             
             window_id = None
             try:
-                with _pool_lock:
-                    if _failed_windows:
-                        window_id = _failed_windows.pop(0)
-                        log.info(f"♻️ 复用失败窗口: {window_id}")
-                if not window_id:
-                    r = client.create_window(payload)
-                    if not r.get("success"):
-                        data = r.get("data", {})
-                        temp_window_id = data.get("id") or ""
-                        if temp_window_id:
-                            log.warning(f"⚠️ 窗口创建API返回失败但返回了窗口ID，暂不删除: {temp_window_id}")
-                        return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
+                r = client.create_window(payload)
+                if not r.get("success"):
                     data = r.get("data", {})
-                    window_id = data.get("id") or ""
-                    if not window_id:
-                        log.error("❌ 窗口创建成功但未返回窗口ID")
-                        return (False, email, "FAIL: No window ID", None)
-                    log.info(f"🆕 创建新窗口: {window_id}")
+                    temp_window_id = data.get("id") or ""
+                    return (False, email, f"FAIL: {r.get('msg')}", temp_window_id if temp_window_id else None)
+                data = r.get("data", {})
+                window_id = data.get("id") or ""
+                if not window_id:
+                    return (False, email, "FAIL: No window ID", None)
+                log.info(f"🆕 创建新窗口: {window_id}")
             except Exception as acquire_err:
-                log.error(f"❌ 获取窗口失败: {acquire_err}")
                 return (False, email, f"ERROR {email}: {acquire_err}", None)
             
             # 检查中断标志（在打开窗口前检查）
@@ -647,64 +636,33 @@ def register_accounts_batch(
             )
             
             if auto_ok:
-                # 注册成功，关闭窗口
                 if window_id:
                     try:
-                        log.info(f"✅ 注册成功，关闭窗口: {window_id}")
                         close_result = client.close_window(window_id)
-                        if close_result.get("success"):
-                            log.info(f"✅ 窗口已关闭: {window_id}")
-                        else:
-                            log.warning(f"⚠️ 关闭窗口失败: {close_result.get('msg')}")
-                    except Exception as close_err:
-                        log.error(f"❌ 关闭窗口异常: {close_err}")
-                try:
-                    with _pool_lock:
-                        if window_id and window_id not in _success_windows:
-                            _success_windows.append(window_id)
-                        try:
-                            _failed_windows.remove(window_id)
-                        except ValueError:
-                            pass
-                except Exception as pool_err:
-                    log.warning(f"⚠️ 成功池更新失败: {pool_err}")
+                        log.info(f"close_window: {close_result}")
+                    except Exception:
+                        pass
                 return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
             else:
-                # 注册失败，仅关闭窗口，不删除；保留用于重试
                 if window_id:
                     try:
-                        log.info(f"⚠️ 注册失败，关闭窗口以供重试: {window_id}")
-                        client.close_window(window_id)
-                        with _pool_lock:
-                            if window_id not in _failed_windows:
-                                _failed_windows.append(window_id)
-                            try:
-                                _success_windows.remove(window_id)
-                            except ValueError:
-                                pass
-                        log.info(f"📦 失败窗口池大小: {len(_failed_windows)}")
-                    except Exception as close_err:
-                        log.warning(f"⚠️ 关闭失败窗口异常: {close_err}")
+                        force_cleanup_window(client, window_id, bitbrowser_password, log)
+                    except Exception:
+                        pass
                 return (False, email, f"FAIL {idx}/{len(rows)}: {email} - automation failed", window_id)
                 
         except Exception as e:
             # 异常时可删除未成功的窗口
             log.error(f"❌ 注册过程发生异常: {e}")
             if window_id:
-                log.info(f"🧹 异常发生，清理窗口: {window_id}")
-                force_cleanup_window(client, window_id, bitbrowser_password, log)
                 try:
-                    with _pool_lock:
-                        try:
-                            _failed_windows.remove(window_id)
-                        except ValueError:
-                            pass
-                        try:
-                            _success_windows.remove(window_id)
-                        except ValueError:
-                            pass
-                except Exception as pool_err:
-                    log.warning(f"⚠️ 清理池更新失败: {pool_err}")
+                    # 弹窗场景：关闭并删除
+                    if str(e) == "POPUP_DETECTED":
+                        force_cleanup_window(client, window_id, bitbrowser_password, log)
+                        return (False, email, f"POPUP {idx}/{len(rows)}: {email}", window_id)
+                except Exception:
+                    pass
+                force_cleanup_window(client, window_id, bitbrowser_password, log)
             return (False, email, f"ERROR {email}: {e}", None)
     
     # 使用线程池并发执行
@@ -746,7 +704,10 @@ def register_accounts_batch(
                     else:
                         fail += 1
                         log.error(f"❌ {message}")
-                        update_csv_status(csv_path, result_email, "失败")
+                        if message.startswith("POPUP "):
+                            update_csv_status(csv_path, result_email, "弹窗")
+                        else:
+                            update_csv_status(csv_path, result_email, "失败")
                 except Exception as e:
                     fail += 1
                     error_msg = f"ERROR {email}: {e}"
@@ -766,4 +727,38 @@ def register_accounts_batch(
         f"{'='*60}"
     )
     log.info(summary)
+    try:
+        import os as _os
+        if _os.environ.get("KL_CLEANUP_GUARD", "0") == "1" and bitbrowser_base_url:
+            client = BitBrowserClient(bitbrowser_base_url)
+            cleanup_residual_windows(client, csv_path, log)
+    except Exception:
+        pass
     return "\n".join(outputs + [summary])
+def cleanup_residual_windows(client: BitBrowserClient, csv_path: Path, logger) -> None:
+    try:
+        rows = load_accounts_csv(csv_path, skip_success=False)
+        names = set([r.get("windowName") for r in rows if r.get("status") == "失败" and r.get("windowName")])
+        if not names:
+            return
+        resp = client.list_windows()
+        if not resp.get("success"):
+            return
+        data = resp.get("data", {})
+        lst = data.get("list") or data.get("data") or []
+        for w in lst:
+            wname = (w.get("remark") or w.get("name") or w.get("windowName") or "").replace(" ", "")
+            if wname and wname in names:
+                wid = w.get("id") or w.get("windowId") or ""
+                if wid:
+                    try:
+                        client.close_window(wid)
+                    except Exception:
+                        pass
+                    try:
+                        client.delete_window(wid)
+                        logger.info(f"🧹 清理残留窗口: {wid} ({wname})")
+                    except Exception:
+                        pass
+    except Exception:
+        pass

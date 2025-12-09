@@ -42,6 +42,20 @@ class BitBrowserClient:
                     # 重新抛出异常让上层处理
                     raise
 
+    def post_variants(self, paths: list, json: Dict[str, Any]) -> Dict[str, Any]:
+        last_err = None
+        for p in paths:
+            try:
+                return self.post(p, json)
+            except Exception as e:
+                last_err = e
+                import logging
+                logging.getLogger(__name__).warning(f"endpoint_try_fail path={p}: {e}")
+                continue
+        if last_err:
+            raise last_err
+        return {}
+
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         # 增加重试机制
         max_retries = 3
@@ -63,6 +77,20 @@ class BitBrowserClient:
                     log.error(f"❌ 网络请求失败 {path}: {e}")
                     # 重新抛出异常让上层处理
                     raise
+
+    def get_variants(self, paths: list, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        last_err = None
+        for p in paths:
+            try:
+                return self.get(p, params)
+            except Exception as e:
+                last_err = e
+                import logging
+                logging.getLogger(__name__).warning(f"endpoint_try_fail path={p}: {e}")
+                continue
+        if last_err:
+            raise last_err
+        return {}
 
     def health(self) -> Dict[str, Any]:
         return self.post("/health", {})
@@ -93,21 +121,41 @@ class BitBrowserClient:
         return self.get("/browser/list")
 
     def switch_tab(self, window_id: str, tab_id: str) -> Dict[str, Any]:
-        return self.post("/browser/switchTab", {"id": window_id, "tabId": tab_id})
+        return self.post_variants([
+            "/browser/switchTab",
+            "/browser/switch-tab",
+            "/browser/tab/switch",
+        ], {"id": window_id, "tabId": tab_id})
 
     def get_window_tabs(self, window_id: str) -> Dict[str, Any]:
-        return self.post("/browser/getTabs", {"id": window_id})
+        return self.post_variants([
+            "/browser/getTabs",
+            "/browser/tabs",
+            "/browser/tab/list",
+        ], {"id": window_id})
 
     def navigate_to(self, window_id: str, url: str) -> Dict[str, Any]:
-        return self.post("/browser/navigate", {"id": window_id, "url": url})
+        return self.post_variants([
+            "/browser/navigate",
+            "/browser/tab/navigate",
+            "/browser/url",
+        ], {"id": window_id, "url": url})
 
     def close_tab(self, window_id: str, tab_id: str) -> Dict[str, Any]:
         """关闭指定标签页"""
-        return self.post("/browser/closeTab", {"id": window_id, "tabId": tab_id})
+        return self.post_variants([
+            "/browser/closeTab",
+            "/browser/close-tab",
+            "/browser/tab/close",
+        ], {"id": window_id, "tabId": tab_id})
 
     def open_tab(self, window_id: str, url: str) -> Dict[str, Any]:
         """在新标签页中打开URL"""
-        return self.post("/browser/openTab", {"id": window_id, "url": url})
+        return self.post_variants([
+            "/browser/openTab",
+            "/browser/open-tab",
+            "/browser/tab/open",
+        ], {"id": window_id, "url": url})
 
     def activate(self, window_id: str) -> Dict[str, Any]:
         """激活窗口并确保显示在前台"""
@@ -361,4 +409,3 @@ class BitBrowserClient:
             import traceback
             log.error(traceback.format_exc())
             return None
-
