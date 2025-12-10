@@ -705,7 +705,7 @@ def register_accounts_batch(
                         fail += 1
                         log.error(f"❌ {message}")
                         if message.startswith("POPUP "):
-                            update_csv_status(csv_path, result_email, "弹窗")
+                            update_csv_status(csv_path, result_email, "弹窗弹窗")
                         else:
                             update_csv_status(csv_path, result_email, "失败")
                 except Exception as e:

@@ -723,13 +723,13 @@ def run_registration_flow(
             max_consecutive_failures = 2
             
             # 通用安全操作封装
-            def element_exists(xpath: str, timeout_ms: int = 50000) -> bool:
-                """检查元素是否存在 - 使用轮询机制，默认50秒超时"""
+            def element_exists(xpath: str, timeout_ms: int = 50000, poll_ms: int = 300) -> bool:
+                """检查元素是否存在 - 轮询机制，可配置超时与轮询间隔"""
                 import time
                 start_time = time.time()
-                poll_interval = 0.3  # 每300毫秒检查一次
+                poll_interval = max(0.05, (poll_ms / 1000.0))
                 
-                log.info(f"🔍 轮询查找元素 (超时={timeout_ms}ms): {xpath[:80]}...")
+                log.info(f"🔍 轮询查找元素 (超时={timeout_ms}ms, 间隔={int(poll_interval*1000)}ms): {xpath[:80]}...")
                 
                 while (time.time() - start_time) * 1000 < timeout_ms:
                     try:
@@ -1443,14 +1443,18 @@ def run_registration_flow(
                                 tab = xpaths.get("text_to_image_tab")
                                 if tab:
                                     safe_click(tab, timeout_ms=10000, required=False)
+                                    time.sleep(1)
                                 prompt = xpaths.get("prompt_input")
                                 if prompt:
-                                    safe_fill(prompt, "a girl", timeout_ms=10000, required=False)
+                                    # 确保输入前元素已出现
+                                    element_exists(prompt, timeout_ms=5000, poll_ms=300)
+                                    safe_fill(prompt, "a girl", timeout_ms=10000, required=True)
+                                    time.sleep(1)
                                 gen_btn = xpaths.get("generate_btn")
                                 if gen_btn:
                                     safe_click(gen_btn, timeout_ms=10000, required=False)
                                 images = xpaths.get("images_header")
-                                if images and element_exists(images, timeout_ms=30000):
+                                if images and element_exists(images, timeout_ms=8000, poll_ms=500):
                                     return True
                                 raise Exception("POPUP_DETECTED")
                             return verify_images_success()
@@ -1502,14 +1506,17 @@ def run_registration_flow(
                         tab = xpaths.get("text_to_image_tab")
                         if tab:
                             safe_click(tab, timeout_ms=10000, required=False)
+                            time.sleep(1)
                         prompt = xpaths.get("prompt_input")
                         if prompt:
-                            safe_fill(prompt, "a girl", timeout_ms=10000, required=False)
+                            element_exists(prompt, timeout_ms=5000, poll_ms=300)
+                            safe_fill(prompt, "a girl", timeout_ms=10000, required=True)
+                            time.sleep(1)
                         gen_btn = xpaths.get("generate_btn")
                         if gen_btn:
                             safe_click(gen_btn, timeout_ms=10000, required=False)
                         images = xpaths.get("images_header")
-                        if images and element_exists(images, timeout_ms=30000):
+                        if images and element_exists(images, timeout_ms=8000, poll_ms=500):
                             return True
                         raise Exception("POPUP_DETECTED")
                     return verify_images_success_manual()
@@ -1522,14 +1529,17 @@ def run_registration_flow(
                     tab = xpaths.get("text_to_image_tab")
                     if tab:
                         safe_click(tab, timeout_ms=10000, required=False)
+                        time.sleep(1)
                     prompt = xpaths.get("prompt_input")
                     if prompt:
-                        safe_fill(prompt, "a girl", timeout_ms=10000, required=False)
+                        element_exists(prompt, timeout_ms=5000, poll_ms=300)
+                        safe_fill(prompt, "a girl", timeout_ms=10000, required=True)
+                        time.sleep(1)
                     gen_btn = xpaths.get("generate_btn")
                     if gen_btn:
                         safe_click(gen_btn, timeout_ms=10000, required=False)
                     images = xpaths.get("images_header")
-                    if images and element_exists(images, timeout_ms=30000):
+                    if images and element_exists(images, timeout_ms=8000, poll_ms=500):
                         return True
                     raise Exception("POPUP_DETECTED")
                 return verify_images_success_nocode()

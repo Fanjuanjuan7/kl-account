@@ -14,8 +14,8 @@
   "code_url_element": "//*[@placeholder='Verification Code']",
   "final_submit_btn": "//*[@class='generic-button critical large']",
   "close_popup_svg": "//*[@class='el-icon el-dialog__close']",
-  "text_to_image_tab": "//*[@id='text-to-image-sidebar-link-id']/div/span",
+  "text_to_image_tab": "//*[@class='tiptap ProseMirror']",
   "prompt_input": "//*[@role='textbox']",
   "generate_btn": "//*[@class='generic-button critical big el-tooltip__trigger']",
-  "images_header": "//*[@class='bottom-center-actions']"
+  "images_header": "//*[@class='loading-content']"
 }
