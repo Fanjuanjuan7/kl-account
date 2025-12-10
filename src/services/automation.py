@@ -3,7 +3,12 @@ from typing import Dict, Any, Optional
 import time
 import random
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Frame
-from ..utils.logger import get_logger
+try:
+    from ..utils.logger import get_logger
+except Exception:
+    import sys, os
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from utils.logger import get_logger
 
 # 图像识别相关库（可选）
 try:
@@ -488,9 +493,8 @@ def run_registration_flow(
                                 try:
                                     page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
                                     log.info(f"Successfully navigated to {target_url}")
-                                    # 等待页面加载完成
-                                    page.wait_for_load_state("networkidle", timeout=30000)
-                                    log.info("Page loaded successfully")
+                                    # 不再等待networkidle，domcontentloaded已足够
+                                    log.info("Page DOM content loaded; proceeding without full network idle")
                                 except Exception as nav_error:
                                     log.error(f"Failed to navigate: {nav_error}")
                                     # 如果导航失败，至少等待DOM加载
@@ -613,17 +617,7 @@ def run_registration_flow(
                     log.info("✅ Page navigation started, waiting for content...")
                     
                     # 尝试等待networkidle，但不强制
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=30000)
-                        log.info("✅ Page fully loaded (networkidle)")
-                    except Exception as load_err:
-                        log.warning(f"⚠️ Network idle timeout, but page content may be ready: {load_err}")
-                        # 等待domcontentloaded就够了
-                        try:
-                            page.wait_for_load_state("domcontentloaded", timeout=10000)
-                            log.info("✅ Page content loaded (domcontentloaded)")
-                        except Exception:
-                            log.warning("⚠️ DOM content load timeout, continuing anyway...")
+                    
                 
                 except Exception as nav_err:
                     log.error(f"❌ Page navigation failed: {nav_err}")
@@ -652,11 +646,7 @@ def run_registration_flow(
                         # 再次尝试访问
                         try:
                             page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-                            log.info("✅ Page loaded successfully (without proxy)")
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=20000)
-                            except Exception:
-                                pass
+                            log.info("✅ Page DOM content loaded (without proxy); skipping network idle wait")
                         except Exception as retry_err:
                             log.error(f"❌ Failed to load page even without proxy: {retry_err}")
                             raise
@@ -668,17 +658,41 @@ def run_registration_flow(
             except Exception as e:
                 log.warning(f"置于顶层失败: {e}")
             
-            # 等待页面完全加载并稳定
-            log.info("⏰ 等待页面完全加载...")
-            time.sleep(3)  # 给页面更多时间加载和渲染
+            try:
+                def _block_static(route):
+                    req = route.request
+                    url = req.url.lower()
+                    if req.resource_type in ["image", "media"]:
+                        return route.abort()
+                    for k in ["google-analytics.com", "doubleclick", "gtag", "mixpanel", "amplitude", "hotjar", "pixel"]:
+                        if k in url:
+                            return route.abort()
+                    return route.continue_()
+                page.route("**/*", _block_static)
+                log.info("🚫 已启用静态资源屏蔽: image/media/analytics")
+            except Exception:
+                pass
             
-            # 记录当前页面状态
+            # 优化：不再等待整页完全加载，后续直接按步骤执行
+            
+            # 记录当前页面状态（已简化，避免额外的try/except嵌套）
+            current_url = None
+            current_title = None
             try:
                 current_url = page.url
+            except Exception:
+                current_url = None
+            try:
                 current_title = page.title()
+            except Exception:
+                current_title = None
+            try:
+                perf = page.evaluate("() => ({ t: performance.timing, nav: performance.getEntriesByType('navigation')[0] || null })")
+                log.info(f"⏱️ 性能: domContentLoaded={(perf.get('t', {}).get('domContentLoadedEventEnd', 0))} firstByte={(perf.get('t', {}).get('responseStart', 0))}")
+            except Exception:
+                pass
+            if current_url or current_title:
                 log.info(f"🌐 当前页面: 标题='{current_title}', URL={current_url}")
-            except Exception as e:
-                log.warning(f"获取页面信息失败: {e}")
             
             # 获取实际窗口大小并记录
             try:
@@ -709,21 +723,134 @@ def run_registration_flow(
                 page.on("console", lambda msg: log.info(f"浏览器控制台 {msg.type}: {msg.text}"))
             except Exception as e:
                 log.warning(f"设置控制台监听失败: {e}")
+            # 监听网络请求失败与响应状态，便于定位BitBrowser网络异常
+            try:
+                page.on("requestfailed", lambda req: log.warning(f"请求失败: {req.url} type={req.resource_type} failure={req.failure}") )
+                page.on("response", lambda res: log.info(f"响应: {res.request.url} status={res.status}") )
+            except Exception as e:
+                log.warning(f"设置网络监听失败: {e}")
             
             # 截图保存当前页面状态
-            try:
-                screenshot_path = runtime_dir / f"page_initial_{int(time.time()*1000)}.png"
-                page.screenshot(path=str(screenshot_path), full_page=True)
-                log.info(f"📸 初始截图已保存: {screenshot_path}")
-            except Exception as e:
-                log.warning(f"截图保存失败: {e}")
             
+            
+            # 语言与入口初始化（放在最前面按JSON顺序执行）
+            log.info("\n" + "="*60)
+            log.info("步骤1: 悬停语言菜单并切换到 English")
+            log.info("="*60)
+            lang_menu = xpaths.get("language_menu")
+            if lang_menu:
+                try:
+                    loc = page.locator(f"xpath={lang_menu}")
+                    loc.wait_for(state="visible", timeout=20000)
+                    try:
+                        loc.scroll_into_view_if_needed(timeout=3000)
+                    except Exception:
+                        pass
+                    try:
+                        loc.hover(timeout=5000)
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                except Exception:
+                    log.warning(f"⚠️ 语言菜单不可见或不可交互，继续尝试直接点击English: {lang_menu[:80]}")
+            english = xpaths.get("english_option")
+            if english:
+                try:
+                    # 优先在语言菜单作用域内查找English，避免误匹配正文中的“English”
+                    if lang_menu:
+                        loc = page.locator(f"xpath={lang_menu}").locator("xpath=//*[text()='English']")
+                    else:
+                        loc = page.locator(f"xpath={english}")
+                    loc.wait_for(state="visible", timeout=20000)
+                    try:
+                        loc.scroll_into_view_if_needed(timeout=3000)
+                    except Exception:
+                        pass
+                    try:
+                        loc.click(timeout=5000)
+                    except Exception:
+                        try:
+                            page.evaluate(
+                                """
+                                (xpath) => {
+                                    const n = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                    if (n) { n.click(); return true; }
+                                    return false;
+                                }
+                                """,
+                                english,
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(1)
+                except Exception:
+                    return False
+            log.info("\n" + "="*60)
+            log.info("步骤2: 点击 Creative Studio 与 More Tools")
+            log.info("="*60)
+            cs = xpaths.get("Creative Studio")
+            if cs:
+                try:
+                    loc = page.locator(f"xpath={cs}")
+                    loc.wait_for(state="visible", timeout=20000)
+                    try:
+                        loc.scroll_into_view_if_needed(timeout=3000)
+                    except Exception:
+                        pass
+                    try:
+                        loc.click(timeout=5000)
+                    except Exception:
+                        try:
+                            page.evaluate(
+                                """
+                                (xpath) => {
+                                    const n = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                    if (n) { n.click(); return true; }
+                                    return false;
+                                }
+                                """,
+                                cs,
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(1)
+                except Exception:
+                    return False
+            mt = xpaths.get("More Tools")
+            if mt:
+                try:
+                    loc = page.locator(f"xpath={mt}")
+                    loc.wait_for(state="visible", timeout=20000)
+                    try:
+                        loc.scroll_into_view_if_needed(timeout=3000)
+                    except Exception:
+                        pass
+                    try:
+                        loc.click(timeout=5000)
+                    except Exception:
+                        try:
+                            page.evaluate(
+                                """
+                                (xpath) => {
+                                    const n = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                    if (n) { n.click(); return true; }
+                                    return false;
+                                }
+                                """,
+                                mt,
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(1)
+                except Exception:
+                    return False
+
             # 初始化连续失败计数器
             consecutive_failures = 0
             max_consecutive_failures = 2
             
             # 通用安全操作封装
-            def element_exists(xpath: str, timeout_ms: int = 50000, poll_ms: int = 300) -> bool:
+            def element_exists(xpath: str, timeout_ms: int = 20000, poll_ms: int = 500) -> bool:
                 """检查元素是否存在 - 轮询机制，可配置超时与轮询间隔"""
                 import time
                 start_time = time.time()
@@ -756,7 +883,7 @@ def run_registration_flow(
                 return False
             
 
-            def safe_click(xpath: Optional[str], timeout_ms: int = 50000, required: bool = False) -> bool:
+            def safe_click(xpath: Optional[str], timeout_ms: int = 20000, required: bool = False) -> bool:
                 global consecutive_failures
                 if not xpath:
                     return True
@@ -769,12 +896,6 @@ def run_registration_flow(
                             time.sleep(2)
                             continue
                         if required:
-                            try:
-                                fp = runtime_dir / f"shot_element_not_found_{ts}.png"
-                                page.screenshot(path=str(fp))
-                                log.info(f"saved={fp}")
-                            except Exception:
-                                pass
                             consecutive_failures += 1
                             msg = f"required element not found: {xpath[:80]}"
                             raise Exception(msg)
@@ -813,12 +934,6 @@ def run_registration_flow(
                                 time.sleep(2)
                                 continue
                             if required:
-                                try:
-                                    fp = runtime_dir / f"shot_click_fail_{ts}.png"
-                                    page.screenshot(path=str(fp))
-                                    log.info(f"saved={fp}")
-                                except Exception:
-                                    pass
                                 consecutive_failures += 1
                                 msg = f"required click failed: {xpath[:80]}"
                                 raise Exception(msg)
@@ -829,12 +944,6 @@ def run_registration_flow(
                             time.sleep(2)
                             continue
                         if required:
-                            try:
-                                fp = runtime_dir / f"shot_click_fail_{ts}.png"
-                                page.screenshot(path=str(fp))
-                                log.info(f"saved={fp}")
-                            except Exception:
-                                pass
                             consecutive_failures += 1
                             msg = f"required click failed: {xpath[:80]}"
                             raise Exception(msg)
@@ -898,13 +1007,6 @@ def run_registration_flow(
                             break
                     continue
                 if required:
-                    ts = int(time.time() * 1000)
-                    try:
-                        fp = runtime_dir / f"shot_input_not_found_{ts}.png"
-                        page.screenshot(path=str(fp), full_page=True)
-                        log.info(f"saved={fp}")
-                    except Exception:
-                        pass
                     consecutive_failures += 1
                     msg = f"required input not found: {xpath[:80]}"
                     raise Exception(msg)
@@ -918,13 +1020,7 @@ def run_registration_flow(
             log.info("Step 1: Closing popup (if exists)")
             log.info("="*60)
             
-            close_popup = xpaths.get("close_popup")
-            if close_popup and element_exists(close_popup, timeout_ms=2000):
-                log.info(f"🔍 找到弹窗关闭按钮，尝试关闭...")
-                safe_click(close_popup, timeout_ms=5000, required=False)
-                time.sleep(2)  # 等待弹窗关闭动画完成
-            else:
-                log.info("ℹ️ 没有检测到弹窗")
+            # 弹窗关闭步骤已移除，按语言切换与入口优先执行
             
             # 初始化变量
             login_entry_found = False
@@ -942,18 +1038,7 @@ def run_registration_flow(
                 if safe_click(signin_btn, timeout_ms=10000, required=True):
                     log.info("✅ Sign In 按钮已点击，等待响应...")
                     time.sleep(3)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=20000)
-                    except Exception:
-                        pass
                     
-                    # 确认点击是否生效（截图验证）
-                    try:
-                        screenshot_after_signin = runtime_dir / f"after_signin_{int(time.time()*1000)}.png"
-                        page.screenshot(path=str(screenshot_after_signin), full_page=True)
-                        log.info(f"📸 Sign In后截图: {screenshot_after_signin}")
-                    except Exception:
-                        pass
             elif login_entry_found:
                 log.info("ℹ️ 已通过其他方式进入登录流程，跳过 Sign In 按钮")
             else:
@@ -984,13 +1069,7 @@ def run_registration_flow(
                     except Exception as scroll_err:
                         log.warning(f"⚠️ 滚动失败: {scroll_err}")
                     
-                    # 确认点击是否生效
-                    try:
-                        screenshot_after_email = runtime_dir / f"after_email_option_{int(time.time()*1000)}.png"
-                        page.screenshot(path=str(screenshot_after_email), full_page=True)
-                        log.info(f"📸 邮箱选项后截图: {screenshot_after_email}")
-                    except Exception:
-                        pass
+                    # 移除截图保存逻辑
                 else:
                     log.warning("⚠️ 邮箱登录选项未找到或点击失败")
             else:
@@ -1032,13 +1111,7 @@ def run_registration_flow(
                     except Exception as scroll_err:
                         log.warning(f"⚠️ 滚动失败: {scroll_err}")
                     
-                    # 确认点击是否生效
-                    try:
-                        screenshot_after_signup = runtime_dir / f"after_signup_{int(time.time()*1000)}.png"
-                        page.screenshot(path=str(screenshot_after_signup), full_page=True)
-                        log.info(f"📸 注册后截图: {screenshot_after_signup}")
-                    except Exception:
-                        pass
+                    # 移除截图保存逻辑
                 else:
                     log.warning("⚠️ 注册链接未找到或点击失败")
             else:
@@ -1319,21 +1392,13 @@ def run_registration_flow(
                     log.info(f"🔗 Navigating to code URL: {code_url}")
                     code_page.goto(code_url, timeout=60000, wait_until="domcontentloaded")
                     
-                    # 等待页面加载
+                    # 等待页面内容可用
                     try:
-                        code_page.wait_for_load_state("networkidle", timeout=20000)
-                        log.info("✅ Code page fully loaded")
+                        code_page.wait_for_load_state("domcontentloaded", timeout=20000)
+                        log.info("✅ Code page content loaded")
                     except Exception:
-                        log.warning("⚠️ Network idle timeout, but continuing...")
-                        time.sleep(3)  # 等待一下让页面稳定
-                    
-                    # 保存接码页面截图
-                    try:
-                        code_screenshot = runtime_dir / f"code_page_{int(time.time()*1000)}.png"
-                        code_page.screenshot(path=str(code_screenshot))
-                        log.info(f"📸 Code page screenshot saved: {code_screenshot}")
-                    except Exception as ss_err:
-                        log.warning(f"⚠️ Failed to save code page screenshot: {ss_err}")
+                        log.warning("⚠️ domcontentloaded 超时，继续执行")
+                        time.sleep(2)
                     
                     # 提取验证码
                     verification_code = None
@@ -1435,29 +1500,34 @@ def run_registration_flow(
                             if not clicked:
                                 log.error("❌ Final submit button not found or not clickable")
                                 return False
-                            # 执行注册后验证与生成流程（以Images元素为唯一成功标准）
-                            def verify_images_success() -> bool:
-                                close_svg = xpaths.get("close_popup_svg")
-                                if close_svg:
-                                    safe_click(close_svg, timeout_ms=5000, required=False)
-                                tab = xpaths.get("text_to_image_tab")
-                                if tab:
-                                    safe_click(tab, timeout_ms=10000, required=False)
-                                    time.sleep(1)
-                                prompt = xpaths.get("prompt_input")
-                                if prompt:
-                                    # 确保输入前元素已出现
-                                    element_exists(prompt, timeout_ms=5000, poll_ms=300)
-                                    safe_fill(prompt, "a girl", timeout_ms=10000, required=True)
-                                    time.sleep(1)
-                                gen_btn = xpaths.get("generate_btn")
-                                if gen_btn:
-                                    safe_click(gen_btn, timeout_ms=10000, required=False)
-                                images = xpaths.get("images_header")
-                                if images and element_exists(images, timeout_ms=8000, poll_ms=500):
+                            def verify_steps_success() -> bool:
+                                lang_menu = xpaths.get("language_menu")
+                                if lang_menu:
+                                    if not element_exists(lang_menu, timeout_ms=20000, poll_ms=500):
+                                        raise Exception(f"required element not found: {lang_menu[:80]}")
+                                    try:
+                                        page.locator(f"xpath={lang_menu}").hover(timeout=5000)
+                                        time.sleep(1)
+                                    except Exception:
+                                        pass
+                                english = xpaths.get("english_option")
+                                if english:
+                                    if not safe_click(english, timeout_ms=20000, required=True):
+                                        return False
+                                cs = xpaths.get("Creative Studio")
+                                if cs:
+                                    if not safe_click(cs, timeout_ms=20000, required=True):
+                                        return False
+                                mt = xpaths.get("More Tools")
+                                if mt:
+                                    if not safe_click(mt, timeout_ms=20000, required=True):
+                                        return False
+                                final_ok = xpaths.get("close_popup_svg")
+                                if final_ok and element_exists(final_ok, timeout_ms=20000, poll_ms=500):
+                                    safe_click(final_ok, timeout_ms=20000, required=False)
                                     return True
-                                raise Exception("POPUP_DETECTED")
-                            return verify_images_success()
+                                raise Exception("required final element not found")
+                            return verify_steps_success()
                         else:
                             log.error("❌ Failed to fill verification code")
                             return False
@@ -1475,105 +1545,51 @@ def run_registration_flow(
                         pass
                     return False
             elif code_input_xpath:
-                # 如果没有code_url，但有code_input，则等待用户手动输入
-                log.info("⚠️ No code_url provided, waiting for manual input")
-                final_submit_btn = xpaths.get("final_submit_btn")
-                if final_submit_btn or True:
-                    log.info("⏳ Waiting 30 seconds for manual code input...")
-                    log.info("👉 Please manually input verification code in the browser")
-                    time.sleep(30)
-                    log.info("🔍 Submitting and verifying by Images element...")
-                    candidates = []
-                    if final_submit_btn:
-                        candidates.append(final_submit_btn)
-                    candidates.append("//*[@class='generic-button critical big']")
-                    candidates.append("//*[contains(@class,'generic-button') and contains(@class,'critical')]//*[text()='Submit' or text()='Next']")
-                    clicked = False
-                    for cand in candidates:
-                        try:
-                            if element_exists(cand, timeout_ms=5000):
-                                if safe_click(cand, timeout_ms=10000, required=False):
-                                    clicked = True
-                                    break
-                        except Exception:
-                            pass
-                    if not clicked:
-                        return False
-                    def verify_images_success_manual() -> bool:
-                        close_svg = xpaths.get("close_popup_svg")
-                        if close_svg:
-                            safe_click(close_svg, timeout_ms=5000, required=False)
-                        tab = xpaths.get("text_to_image_tab")
-                        if tab:
-                            safe_click(tab, timeout_ms=10000, required=False)
-                            time.sleep(1)
-                        prompt = xpaths.get("prompt_input")
-                        if prompt:
-                            element_exists(prompt, timeout_ms=5000, poll_ms=300)
-                            safe_fill(prompt, "a girl", timeout_ms=10000, required=True)
-                            time.sleep(1)
-                        gen_btn = xpaths.get("generate_btn")
-                        if gen_btn:
-                            safe_click(gen_btn, timeout_ms=10000, required=False)
-                        images = xpaths.get("images_header")
-                        if images and element_exists(images, timeout_ms=8000, poll_ms=500):
-                            return True
-                        raise Exception("POPUP_DETECTED")
-                    return verify_images_success_manual()
+                log.error("❌ 手动接码流程已移除，缺少 code_url 无法继续")
+                return False
             else:
-                log.warning("⚠️ No verification code XPath configured, verifying by Images element")
-                def verify_images_success_nocode() -> bool:
-                    close_svg = xpaths.get("close_popup_svg")
-                    if close_svg:
-                        safe_click(close_svg, timeout_ms=5000, required=False)
-                    tab = xpaths.get("text_to_image_tab")
-                    if tab:
-                        safe_click(tab, timeout_ms=10000, required=False)
-                        time.sleep(1)
-                    prompt = xpaths.get("prompt_input")
-                    if prompt:
-                        element_exists(prompt, timeout_ms=5000, poll_ms=300)
-                        safe_fill(prompt, "a girl", timeout_ms=10000, required=True)
-                        time.sleep(1)
-                    gen_btn = xpaths.get("generate_btn")
-                    if gen_btn:
-                        safe_click(gen_btn, timeout_ms=10000, required=False)
-                    images = xpaths.get("images_header")
-                    if images and element_exists(images, timeout_ms=8000, poll_ms=500):
-                        return True
-                    raise Exception("POPUP_DETECTED")
-                return verify_images_success_nocode()
+                log.error("❌ 无接码流程已移除，必须提供 code_url")
+                return False
     except Exception as e:
-        if str(e) == "POPUP_DETECTED":
-            raise
         log.error(f"❌ Automation error: {e}")
         import traceback
         log.error(traceback.format_exc())
         
-        # 尝试保存错误截图（检查浏览器和page是否还存在）
-        try:
-            # 检查page对象是否还有效
-            if 'page' in locals() and page is not None:
-                # 检查page是否还未关闭
-                try:
-                    # 尝试获取当前URL来验证page是否有效
-                    _ = page.url
-                    fp = runtime_dir / f"shot_error_{int(time.time()*1000)}.png"
-                    fp.parent.mkdir(parents=True, exist_ok=True)
-                    page.screenshot(path=str(fp))
-                    log.info(f"📸 Error screenshot saved: {fp}")
-                except Exception as page_err:
-                    log.warning(f"⚠️ Page is no longer accessible for screenshot: {page_err}")
-            else:
-                log.warning("⚠️ No page object available for error screenshot")
-        except Exception as screenshot_err:
-            log.warning(f"⚠️ Failed to save error screenshot: {screenshot_err}")
         
-        # 即使出错也要给用户时间查看浏览器状态
-        log.info("⏸️ Error occurred. Keeping browser open for 30 seconds for debugging...")
-        time.sleep(30)
-        
-        if browser_mode == "playwright":
-            log.info("👁️ Browser will remain open for debugging")
         
         return False
+
+if __name__ == "__main__":
+    import json, os
+    runtime_dir = Path(os.path.expanduser("~")) / ".kl_zhanghao"
+    try:
+        base = Path(__file__).resolve().parents[2]
+    except Exception:
+        base = Path(__file__).resolve().parent.parent.parent
+    xfile = base / "samples" / "kling_xpaths.json"
+    try:
+        data = json.loads(xfile.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    for k in [
+        "code_url_element",
+        "code_input",
+        "final_submit_btn",
+        "slider_iframe",
+        "slider_handle",
+        "slider_container",
+    ]:
+        data.pop(k, None)
+    ok = run_registration_flow(
+        email="debug@example.com",
+        password="DebugPass123!",
+        runtime_dir=runtime_dir,
+        xpaths=data,
+        proxy={},
+        platform_url="https://klingai.com/global/",
+        code_url=None,
+        attach_ws=None,
+        dry_run=True,
+        browser_mode="playwright",
+    )
+    print("SUCCESS" if ok else "FAIL")

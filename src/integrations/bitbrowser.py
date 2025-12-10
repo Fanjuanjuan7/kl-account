@@ -96,7 +96,13 @@ class BitBrowserClient:
         return self.post("/health", {})
 
     def create_window(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.post("/browser/update", payload)
+        return self.post_variants([
+            "/browser/update",
+            "/browser/add",
+            "/browser/create",
+            "/profile/update",
+            "/profile/add",
+        ], payload)
 
     def open_window(self, window_id: str) -> Dict[str, Any]:
         return self.post("/browser/open", {"id": window_id})
@@ -158,20 +164,30 @@ class BitBrowserClient:
         ], {"id": window_id, "url": url})
 
     def activate(self, window_id: str) -> Dict[str, Any]:
-        """激活窗口并确保显示在前台"""
-        # 注意：/browser/activate 端点不存在，使用最大化代替
         try:
-            result = self.maximize(window_id)  # 使用最大化确保窗口显示
-            return result
+            return self.post_variants([
+                "/browser/activate",
+                "/browser/maximize",
+                "/browser/window/activate",
+                "/browser/window/maximize",
+                "/browser/focus",
+                "/browser/window/focus",
+                "/browser/bringToFront",
+            ], {"id": window_id})
         except Exception as e:
             import logging
             log = logging.getLogger(__name__)
-            log.error(f"❌ 激活窗口失败 {window_id}: {e}")
-            raise
+            log.warning(f"⚠️ 激活窗口失败 {window_id}: {e}")
+            return {"success": False, "msg": str(e)}
 
     def maximize(self, window_id: str) -> Dict[str, Any]:
-        """最大化窗口"""
-        return self.post("/browser/maximize", {"id": window_id})
+        return self.post_variants([
+            "/browser/maximize",
+            "/browser/window/maximize",
+            "/browser/size/maximize",
+            "/browser/resize/maximize",
+            "/window/maximize",
+        ], {"id": window_id})
 
     def devtools(self, window_id: str) -> Dict[str, Any]:
         """获取DevTools WebSocket地址"""

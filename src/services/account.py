@@ -594,7 +594,7 @@ def register_accounts_batch(
             payload: Dict[str, Any] = {
                 "userName": email,
                 "password": password,
-                "url": platform_url or "https://klingai.com",
+                "url": platform_url or "https://klingai.com/global/",
                 "proxyMethod": 2,
                 "browserFingerPrint": {},
             }
@@ -627,8 +627,10 @@ def register_accounts_batch(
                 return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
             
             window_id = None
+            t0 = time.perf_counter()
             try:
                 r = client.create_window(payload)
+                log.info(f"⏱️ create_window耗时: {time.perf_counter() - t0:.2f}s")
                 if not r.get("success"):
                     data = r.get("data", {})
                     temp_window_id = data.get("id") or ""
@@ -649,18 +651,35 @@ def register_accounts_batch(
                 return (False, email, f"SKIP: 用户中断 {idx}/{len(rows)}: {email}", None)
             
             # 打开窗口
+            t1 = time.perf_counter()
             open_result = client.open_window(window_id)
+            log.info(f"⏱️ open_window耗时: {time.perf_counter() - t1:.2f}s")
             log.info(f"Window opened for {email}: {open_result}")
             time.sleep(5)
             
             # 激活窗口确保显示在前台
+            t2 = time.perf_counter()
             try:
                 activate_result = client.activate(window_id)
                 log.info(f"✅ 窗口已激活: {activate_result}")
             except Exception as activate_err:
                 log.warning(f"⚠️ 窗口激活失败: {activate_err}")
                 # 即使激活失败也继续执行，避免中断整个流程
+            log.info(f"⏱️ activate耗时: {time.perf_counter() - t2:.2f}s")
             
+            # 使用API导航到目标URL，确保由BitBrowser内部加载并走其代理
+            target_url = (platform_url or "https://klingai.com/global/")
+            try:
+                nav_res = client.navigate_to(window_id, target_url)
+                log.info(f"navigate_to: {nav_res}")
+            except Exception as nav_err:
+                log.warning(f"导航API调用失败: {nav_err}")
+            # 等待并切换到包含目标URL的标签页
+            try:
+                _wait_and_switch_to_new_tab(client, window_id, target_url, max_retries=10, retry_interval=2.0, log=log)
+            except Exception as switch_err:
+                log.warning(f"切换标签失败: {switch_err}")
+
             # 等待窗口稳定
             time.sleep(2)
             
@@ -682,12 +701,14 @@ def register_accounts_batch(
                             log.info(f"✅ Constructed WebSocket: {ws}")
             
             # 再次激活窗口确保显示在前台
+            t3 = time.perf_counter()
             try:
                 client.activate(window_id)
                 log.info("✅ 窗口已再次激活")
             except Exception as activate_err:
                 log.warning(f"⚠️ 窗口再次激活失败: {activate_err}")
                 # 即使激活失败也继续执行，避免中断整个流程
+            log.info(f"⏱️ re-activate耗时: {time.perf_counter() - t3:.2f}s")
             
             # 检查中断标志（在执行自动化前检查）
             if stop_flag and stop_flag.get("stop", False):
@@ -708,7 +729,7 @@ def register_accounts_batch(
                     "username": puser,
                     "password": ppass,
                 },
-                platform_url=platform_url or "https://klingai.com",
+                platform_url=platform_url or "https://klingai.com/global/",
                 code_url=code_url,
                 attach_ws=ws,
                 dry_run=dry_run,
@@ -724,6 +745,7 @@ def register_accounts_batch(
                         pass
                 return (True, email, f"SUCCESS {idx}/{len(rows)}: {email}", window_id)
             else:
+                # 失败后：关闭并删除窗口
                 if window_id:
                     try:
                         force_cleanup_window(client, window_id, bitbrowser_password, log)
