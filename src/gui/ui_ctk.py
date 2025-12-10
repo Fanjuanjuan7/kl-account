@@ -177,10 +177,13 @@ class KLZhanghaoApp(ctk.CTk):
                      fg_color="red", hover_color="darkred", width=150).pack(side="right", padx=5, pady=5)
     
     def browse_csv(self):
-        """浏览CSV文件"""
         filename = filedialog.askopenfilename(
-            title="选择CSV文件",
-            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")]
+            title="选择数据文件",
+            filetypes=[
+                ("CSV文件", "*.csv"),
+                ("Excel文件", "*.xlsx *.xls"),
+                ("所有文件", "*.*"),
+            ]
         )
         if filename:
             self.csv_entry.delete(0, "end")
@@ -210,19 +213,18 @@ class KLZhanghaoApp(ctk.CTk):
             self.update_status("已切换到比特浏览器模式", "blue")
     
     def load_csv(self):
-        """加载CSV文件"""
         csv_path = self.csv_entry.get()
         if not csv_path:
-            self.update_status("请先选择CSV文件", "red")
+            self.update_status("请先选择数据文件", "red")
             return
         
         try:
             p = Path(csv_path)
             if not p.exists():
-                self.update_status("CSV文件不存在", "red")
+                self.update_status("数据文件不存在", "red")
                 return
             
-            rows = self.parse_csv_preview(p)
+            rows = self.parse_data_preview(p)
             if rows:
                 # 检测表头
                 candidates = ["email", "password", "host", "port", "code_url"]
@@ -241,61 +243,87 @@ class KLZhanghaoApp(ctk.CTk):
                 
                 self.update_status(f"已加载 {len(data_rows)} 行数据", "green")
             else:
-                self.update_status("CSV为空", "red")
+                self.update_status("文件为空", "red")
         except Exception as e:
             self.log.exception("Load CSV error")
             self.update_status(f"加载失败: {e}", "red")
     
-    def parse_csv_preview(self, csv_path: Path) -> List[List[str]]:
-        """解析CSV预览"""
-        rows = []
-        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
-            sample = f.read(2048)
-            f.seek(0)
-            
-            # 尝试自动检测CSV格式
-            dialect = None
+    def parse_data_preview(self, path: Path) -> List[List[str]]:
+        rows: List[List[str]] = []
+        suf = path.suffix.lower()
+        if suf in [".xlsx", ".xls"]:
             try:
-                detected_dialect = csv.Sniffer().sniff(sample)
-                # 验证分隔符是否有效：必须是单字符且是常见分隔符
-                valid_delimiters = [',', '\t', ';', '|']
-                if (hasattr(detected_dialect, 'delimiter') and 
-                    len(detected_dialect.delimiter) == 1 and
-                    detected_dialect.delimiter in valid_delimiters):
-                    dialect = detected_dialect
-                    self.log.info(f"✅ 检测到CSV分隔符: '{detected_dialect.delimiter}'")
+                if suf == ".xlsx":
+                    import openpyxl
+                    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+                    ws = wb.worksheets[0]
+                    for r in ws.iter_rows(values_only=True):
+                        rows.append(["" if v is None else str(v) for v in list(r)])
                 else:
-                    invalid_delim = getattr(detected_dialect, 'delimiter', 'unknown')
-                    self.log.warning(f"⚠️ 检测到无效分隔符: '{invalid_delim}'，将尝试其他方式")
+                    import xlrd
+                    book = xlrd.open_workbook(str(path))
+                    sheet = book.sheet_by_index(0)
+                    for i in range(sheet.nrows):
+                        row = sheet.row_values(i)
+                        rows.append([str(v) if v is not None else "" for v in row])
             except Exception as e:
-                self.log.warning(f"⚠️ CSV格式检测失败: {e}，将使用默认格式")
-            
-            # 如果自动检测失败，尝试常见分隔符
-            if dialect is None:
-                for delim in [',', '\t', ';', '|']:
+                raise RuntimeError(f"Excel解析失败: {e}")
+            return rows
+        encs = ["utf-8-sig", "utf-8", "gb18030", "gbk", "big5", "shift_jis", "latin-1"]
+        detected = None
+        try:
+            import chardet
+            raw = path.read_bytes()[:4096]
+            det = chardet.detect(raw)
+            enc = det.get("encoding")
+            if enc:
+                detected = enc
+        except Exception:
+            detected = None
+        used = detected or encs[0]
+        for enc in ([used] + [e for e in encs if e != used]):
+            try:
+                with path.open("r", encoding=enc, newline="") as f:
+                    sample = f.read(2048)
                     f.seek(0)
+                    dialect = None
                     try:
-                        test_reader = csv.reader(f, delimiter=delim)
-                        first_row = next(test_reader)
-                        if len(first_row) > 1:  # 至少有2列
-                            f.seek(0)
-                            dialect = csv.excel
-                            dialect.delimiter = delim
-                            self.log.info(f"✅ 使用分隔符: '{delim}'")
-                            break
+                        detected_dialect = csv.Sniffer().sniff(sample)
+                        valid_delimiters = [',', '\t', ';', '|']
+                        if (hasattr(detected_dialect, 'delimiter') and 
+                            len(detected_dialect.delimiter) == 1 and
+                            detected_dialect.delimiter in valid_delimiters):
+                            dialect = detected_dialect
+                        else:
+                            invalid_delim = getattr(detected_dialect, 'delimiter', 'unknown')
+                            self.log.warning(f"检测到无效分隔符: '{invalid_delim}'，尝试其他方式")
                     except Exception:
-                        continue
-            
-            # 如果还是没找到，使用默认逗号
-            if dialect is None:
-                dialect = csv.excel
-                self.log.info("⚠️ 使用默认逗号分隔符")
-            
-            f.seek(0)
-            reader = csv.reader(f, dialect)
-            for row in reader:
-                rows.append(row)
-        return rows
+                        pass
+                    if dialect is None:
+                        for delim in [',', '\t', ';', '|']:
+                            f.seek(0)
+                            try:
+                                test_reader = csv.reader(f, delimiter=delim)
+                                first_row = next(test_reader)
+                                if len(first_row) > 1:
+                                    f.seek(0)
+                                    dialect = csv.excel
+                                    dialect.delimiter = delim
+                                    break
+                            except Exception:
+                                continue
+                    if dialect is None:
+                        dialect = csv.excel
+                    f.seek(0)
+                    reader = csv.reader(f, dialect)
+                    for row in reader:
+                        rows.append(row)
+                    return rows
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                raise RuntimeError(f"CSV解析失败: {e}")
+        raise RuntimeError("无法读取CSV，编码可能不受支持")
     
     def load_xpath_json(self, path: Path) -> Dict[str, Any]:
         """加载XPath JSON"""

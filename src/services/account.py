@@ -33,14 +33,45 @@ def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
     if csv_key not in _csv_locks:
         _csv_locks[csv_key] = threading.Lock()
     
-    # 使用锁保护CSV文件读写，防止并发冲突
+    # 使用锁保护文件读写
     with _csv_locks[csv_key]:
         try:
-            # 读取所有行
-            rows = []
-            with csv_path.open("r", encoding="utf-8-sig", newline='') as f:
-                reader = csv.reader(f)
-                rows = list(reader)
+            suf = csv_path.suffix.lower()
+            if suf == ".csv":
+                rows = []
+                encs = ["utf-8-sig", "utf-8", "gb18030", "gbk", "latin-1"]
+                detected = None
+                try:
+                    import chardet
+                    raw = csv_path.read_bytes()[:4096]
+                    det = chardet.detect(raw)
+                    enc = det.get("encoding")
+                    if enc:
+                        detected = enc
+                except Exception:
+                    detected = None
+                used = detected or encs[0]
+                ok = False
+                for enc in ([used] + [e for e in encs if e != used]):
+                    try:
+                        with csv_path.open("r", encoding=enc, newline='') as f:
+                            reader = csv.reader(f)
+                            rows = list(reader)
+                            ok = True
+                            break
+                    except UnicodeDecodeError:
+                        continue
+                if not ok:
+                    raise RuntimeError("CSV编码不受支持")
+            elif suf == ".xlsx":
+                import openpyxl
+                wb = openpyxl.load_workbook(csv_path)
+                ws = wb.worksheets[0]
+                rows = []
+                for r in ws.iter_rows(values_only=True):
+                    rows.append(["" if v is None else str(v) for v in list(r)])
+            else:
+                raise RuntimeError("仅支持CSV或XLSX状态更新")
             
             if not rows:
                 log.error("❌ CSV文件为空")
@@ -69,10 +100,19 @@ def update_csv_status(csv_path: Path, email: str, status: str) -> bool:
                 log.warning(f"⚠️ 未找到邮箱 {email} 对应的行")
                 return False
             
-            # 写回文件
-            with csv_path.open("w", encoding="utf-8-sig", newline='') as f:
-                writer = csv.writer(f)
-                writer.writerows(rows)
+            if suf == ".csv":
+                with csv_path.open("w", encoding="utf-8-sig", newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
+            else:
+                import openpyxl
+                wb = openpyxl.load_workbook(csv_path)
+                ws = wb.worksheets[0]
+                has_header = rows[0] and "email" in str(rows[0][0]).lower()
+                start_row = 2 if has_header else 1
+                for i in range(start_row, len(rows) + 1):
+                    ws.cell(row=i, column=9, value=rows[i - 1][8] if len(rows[i - 1]) >= 9 else "")
+                wb.save(csv_path)
             
             log.info(f"✅ CSV文件已更新: {csv_path}")
             return True
@@ -95,9 +135,50 @@ def load_accounts_csv(csv_path: Path, skip_success: bool = True) -> List[Dict[st
     """
     log = get_logger(__name__)
     rows: List[Dict[str, Any]] = []
-    with csv_path.open("r", encoding="utf-8-sig") as f:  # utf-8-sig自动处理BOM
-        reader = csv.reader(f)
-        for i, row in enumerate(reader):
+    suf = csv_path.suffix.lower()
+    raw_rows: List[List[str]] = []
+    if suf == ".csv":
+        encs = ["utf-8-sig", "utf-8", "gb18030", "gbk", "latin-1"]
+        detected = None
+        try:
+            import chardet
+            raw = csv_path.read_bytes()[:4096]
+            det = chardet.detect(raw)
+            enc = det.get("encoding")
+            if enc:
+                detected = enc
+        except Exception:
+            detected = None
+        used = detected or encs[0]
+        ok = False
+        for enc in ([used] + [e for e in encs if e != used]):
+            try:
+                with csv_path.open("r", encoding=enc) as f:
+                    reader = csv.reader(f)
+                    raw_rows = list(reader)
+                    ok = True
+                    break
+            except UnicodeDecodeError:
+                continue
+        if not ok:
+            raise RuntimeError("CSV编码不受支持")
+    elif suf == ".xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(csv_path, read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+        for r in ws.iter_rows(values_only=True):
+            raw_rows.append(["" if v is None else str(v) for v in list(r)])
+    elif suf == ".xls":
+        import xlrd
+        book = xlrd.open_workbook(str(csv_path))
+        sheet = book.sheet_by_index(0)
+        for i in range(sheet.nrows):
+            row = sheet.row_values(i)
+            raw_rows.append([str(v) if v is not None else "" for v in row])
+    else:
+        raise RuntimeError("不支持的文件格式")
+    for i, row in enumerate(raw_rows):
+        
             # 跳过标题行（检查第一列是否包含'email'字样）
             if i == 0 and row and "email" in row[0].lower():
                 continue
@@ -105,8 +186,7 @@ def load_accounts_csv(csv_path: Path, skip_success: bool = True) -> List[Dict[st
                 # 检查第9列状态（索引8）
                 status = row[8].strip() if len(row) >= 9 else ""
                 
-                # 如果skip_success=True，跳过状态为"成功"或"弹窗"的行
-                if skip_success and status in ("成功", "弹窗"):
+                if skip_success and status in ("成功", "弹窗", "弹窗弹窗"):
                     continue
                 
                 rec: Dict[str, Any] = {
